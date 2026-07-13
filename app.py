@@ -1,6 +1,6 @@
 # ==========================================================
 # CLIMA UNIFICADO - INMET + OPEN-METEO
-# Versão para deploy no Render + Google Sheets
+# Versão robusta para deploy no Render + Google Sheets
 #
 # COMO CONFIGURAR (leia antes de rodar):
 #
@@ -15,17 +15,52 @@
 #     o e-mail da Service Account (papel: Editor)
 #  6. Configure GSHEETS_NOME e GSHEETS_LINK como variáveis de
 #     ambiente no Render (ou deixe os valores padrão abaixo)
+#
+# O QUE MUDOU NESTA VERSÃO
+# ─────────────────────────────────────────────────────────
+#  • O INMET publica um ZIP HISTÓRICO ANUAL, não um feed em
+#    tempo real. Antes de baixar de novo (arquivo grande),
+#    o script agora faz um HEAD request e compara o
+#    Last-Modified / tamanho do arquivo com o que já foi
+#    processado. Só baixa e reprocessa se algo mudou de
+#    fato — é isso que faz o comportamento "parecer" com o
+#    Open-Meteo: ele busca a cada execução, mas só troca os
+#    dados quando existe novidade real na fonte.
+#  • Se o ZIP do ano corrente ainda não existir no INMET
+#    (comum no início de janeiro), cai automaticamente para
+#    o ZIP do ano anterior.
+#  • Chamadas de rede (Open-Meteo, INMET, Google Sheets) têm
+#    retries com backoff exponencial.
+#  • Logging estruturado (nível, hora) no lugar de print().
+#  • Google Sheets só reescreve uma aba se os dados dela
+#    realmente mudaram (evita bater no limite de requisições
+#    da API e deixa a atualização mais rápida).
 # ==========================================================
+
+import io
+import logging
+import os
+import threading
+import time
+import zipfile
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
-import zipfile
-import io
-import threading
-import time
-import os
 from flask import Flask, request as flask_request
-from datetime import datetime, date, timedelta
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# ==========================================================
+# LOGGING
+# ==========================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%d/%m/%Y %H:%M:%S",
+)
+log = logging.getLogger("clima")
 
 # ==========================================================
 # ⚙️  CONFIGURAÇÕES PRINCIPAIS
@@ -37,12 +72,15 @@ LONGITUDE = -52.8930
 ESTACOES = {
     "B822":  "Cachoeira do Sul",
     "A803":  "Santa Maria Automática",
-    "83936": "Santa Maria Convencional"
+    "83936": "Santa Maria Convencional",
 }
 
-URL_2026 = "https://portal.inmet.gov.br/uploads/dadoshistoricos/2026.zip"
+ANO_ATUAL = date.today().year
+URL_INMET_BASE = "https://portal.inmet.gov.br/uploads/dadoshistoricos/{ano}.zip"
 
-# De quantas em quantas horas os dados são atualizados automaticamente.
+# De quantas em quantas horas o ciclo de atualização roda.
+# (Note: rodar o ciclo não significa necessariamente baixar o ZIP do INMET
+# de novo — veja "precisa_baixar_inmet_novamente" abaixo.)
 INTERVALO_ATUALIZACAO_HORAS = 1
 
 # ── Google Sheets ────────────────────────────────────────
@@ -51,8 +89,20 @@ GSHEETS_CREDENCIAIS = os.environ.get("GSHEETS_CREDENCIAIS_PATH", "/etc/secrets/c
 GSHEETS_NOME        = os.environ.get("GSHEETS_NOME", "Clima Unificado")
 GSHEETS_LINK        = os.environ.get(
     "GSHEETS_LINK",
-    "https://docs.google.com/spreadsheets/d/1yDFMkt0-Buuijc1LwVc6Sj8Zixk74cc0izi0azvT5sA/edit?gid=192990081#gid=192990081"
+    "https://docs.google.com/spreadsheets/d/1yDFMkt0-Buuijc1LwVc6Sj8Zixk74cc0izi0azvT5sA/edit?gid=192990081#gid=192990081",
 )
+
+# ── Estação Meteorológica (planilha externa, fonte adicional) ──────
+# Essa é uma planilha DIFERENTE da planilha de destino acima — é onde
+# a estação física já registra os dados. O app só LÊ dela e copia os
+# dados para dentro da tabela unificada / da planilha de destino.
+ESTACAO_METEO_SHEET_ID = os.environ.get(
+    "ESTACAO_METEO_SHEET_ID",
+    "1t2ZztZ7zBMZD148G4Ib6USTTkVVe4hWnS-CGgEd7CQM",
+)
+# Nome da aba a ler dentro dessa planilha externa. Deixe em branco para
+# usar a primeira aba automaticamente.
+ESTACAO_METEO_ABA = os.environ.get("ESTACAO_METEO_ABA", "")
 
 # ==========================================================
 # FONTE → CLASSE CSS
@@ -64,14 +114,34 @@ FONTE_CSS = {
     "INMET - Cachoeira do Sul":          "src-cachoeira",
     "INMET - Santa Maria Automática":    "src-sm-auto",
     "INMET - Santa Maria Convencional":  "src-sm-conv",
+    "Estação Meteorológica":             "src-estacao-meteo",
 }
+
+# ==========================================================
+# SESSÃO HTTP COM RETRY/BACKOFF
+# ==========================================================
+
+def criar_sessao():
+    sessao = requests.Session()
+    retry = Retry(
+        total=4,
+        backoff_factor=2,          # 2s, 4s, 8s, 16s entre tentativas
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+    )
+    adaptador = HTTPAdapter(max_retries=retry)
+    sessao.mount("https://", adaptador)
+    sessao.mount("http://", adaptador)
+    return sessao
+
+sessao_http = criar_sessao()
 
 # ==========================================================
 # OPEN-METEO: HOJE HORA A HORA
 # ==========================================================
 
 def coletar_om_horario():
-    print("Buscando Open-Meteo – hoje hora a hora...")
+    log.info("Buscando Open-Meteo – hoje hora a hora...")
     hoje = date.today().isoformat()
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
@@ -82,7 +152,7 @@ def coletar_om_horario():
         f"&timezone=America/Sao_Paulo"
     )
     try:
-        dados = requests.get(url, timeout=30).json()
+        dados = sessao_http.get(url, timeout=30).json()
         h = dados["hourly"]
         linhas = []
         for i, hora in enumerate(h["time"]):
@@ -96,10 +166,10 @@ def coletar_om_horario():
                 "Precip. (mm)":     h["precipitation"][i],
                 "Cód. Clima":       h["weather_code"][i],
             })
-        print(f"OK: {len(linhas)} horas do dia de hoje")
+        log.info(f"OK: {len(linhas)} horas do dia de hoje (Open-Meteo)")
         return pd.DataFrame(linhas)
     except Exception as e:
-        print(f"Erro Open-Meteo horário: {e}")
+        log.error(f"Erro Open-Meteo horário: {e}")
         return pd.DataFrame()
 
 # ==========================================================
@@ -107,7 +177,7 @@ def coletar_om_horario():
 # ==========================================================
 
 def coletar_om_diario():
-    print("Buscando Open-Meteo – previsão diária...")
+    log.info("Buscando Open-Meteo – previsão diária...")
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={LATITUDE}&longitude={LONGITUDE}"
@@ -118,7 +188,7 @@ def coletar_om_diario():
         f"&timezone=America/Sao_Paulo"
     )
     try:
-        dados = requests.get(url, timeout=30).json()
+        dados = sessao_http.get(url, timeout=30).json()
         d = dados["daily"]
         linhas = []
         for i, dia in enumerate(d["time"]):
@@ -134,20 +204,136 @@ def coletar_om_diario():
                 "Nascer do Sol":     d["sunrise"][i],
                 "Pôr do Sol":        d["sunset"][i],
             })
-        print(f"OK: {len(linhas)} dias de previsão")
+        log.info(f"OK: {len(linhas)} dias de previsão (Open-Meteo)")
         return pd.DataFrame(linhas)
     except Exception as e:
-        print(f"Erro Open-Meteo diário: {e}")
+        log.error(f"Erro Open-Meteo diário: {e}")
         return pd.DataFrame()
 
 # ==========================================================
-# INMET
+# GSPREAD — CLIENTE COMPARTILHADO
 # ==========================================================
 
-def coletar_inmet():
-    print("Baixando dados do INMET...")
+_gspread_cliente_cache = None
+
+def _obter_cliente_gspread():
+    """
+    Cria (uma única vez) e reutiliza o cliente autenticado do gspread,
+    tanto para ler a planilha da Estação Meteorológica quanto para
+    escrever na planilha de destino.
+    """
+    global _gspread_cliente_cache
+    if _gspread_cliente_cache is not None:
+        return _gspread_cliente_cache
+
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    if not os.path.exists(GSHEETS_CREDENCIAIS):
+        raise RuntimeError(f"Credenciais não encontradas em {GSHEETS_CREDENCIAIS}")
+
+    escopos = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file(GSHEETS_CREDENCIAIS, scopes=escopos)
+    _gspread_cliente_cache = gspread.authorize(creds)
+    return _gspread_cliente_cache
+
+# ==========================================================
+# ESTAÇÃO METEOROLÓGICA (planilha externa, fonte adicional)
+# ==========================================================
+
+def coletar_estacao_meteorologica():
+    """
+    Lê os dados já lançados na planilha da estação meteorológica física
+    e devolve como DataFrame, com a coluna "Estacao" preenchida, para
+    entrar junto na tabela unificada.
+
+    IMPORTANTE: essa planilha externa precisa estar compartilhada (papel:
+    Leitor ou Editor) com o e-mail da mesma Service Account usada nas
+    outras credenciais do Google Sheets — senão a leitura falha com erro
+    de permissão.
+    """
+    if not ESTACAO_METEO_SHEET_ID:
+        return pd.DataFrame()
+
+    log.info("Buscando dados da Estação Meteorológica (planilha externa)...")
     try:
-        resposta = requests.get(URL_2026, timeout=120)
+        gc = _obter_cliente_gspread()
+        sh = gc.open_by_key(ESTACAO_METEO_SHEET_ID)
+        ws = sh.worksheet(ESTACAO_METEO_ABA) if ESTACAO_METEO_ABA else sh.sheet1
+        registros = ws.get_all_records()
+        if not registros:
+            log.warning("Planilha da Estação Meteorológica está vazia.")
+            return pd.DataFrame()
+        df = pd.DataFrame(registros)
+        df.insert(0, "Estacao", "Estação Meteorológica")
+        log.info(f"OK: {len(df)} registros da Estação Meteorológica")
+        return df
+    except Exception as e:
+        log.error(f"Erro ao ler a planilha da Estação Meteorológica: {e}")
+        return pd.DataFrame()
+
+# ==========================================================
+# INMET — verificação inteligente + fallback de ano
+# ==========================================================
+
+_inmet_assinatura_cache = {}
+_inmet_url_ativa = None
+
+def _obter_assinatura_remota(sessao, url):
+    resp = sessao.head(url, timeout=30, allow_redirects=True)
+    resp.raise_for_status()
+    return (
+        resp.headers.get("Last-Modified"),
+        resp.headers.get("Content-Length"),
+    )
+
+def _resolver_url_inmet(sessao):
+    global _inmet_url_ativa
+    candidatos = [ANO_ATUAL, ANO_ATUAL - 1]
+    for ano in candidatos:
+        url = URL_INMET_BASE.format(ano=ano)
+        try:
+            sessao.head(url, timeout=30, allow_redirects=True).raise_for_status()
+            if _inmet_url_ativa != url:
+                log.info(f"Usando ZIP do INMET: {ano}")
+            _inmet_url_ativa = url
+            return url
+        except Exception:
+            log.warning(f"ZIP do INMET para {ano} indisponível, tentando outro ano...")
+    raise RuntimeError("Nenhum ZIP do INMET disponível (ano atual nem anterior).")
+
+def precisa_baixar_inmet_novamente(sessao, url):
+    try:
+        assinatura_atual = _obter_assinatura_remota(sessao, url)
+    except Exception as e:
+        log.warning(f"Não foi possível checar cabeçalhos do INMET ({e}); vou baixar por precaução.")
+        return True
+
+    assinatura_anterior = _inmet_assinatura_cache.get(url)
+    if assinatura_anterior != assinatura_atual:
+        log.info(f"INMET tem dados novos (assinatura mudou: {assinatura_anterior} → {assinatura_atual}).")
+        return True
+
+    log.info("INMET ainda não atualizou o ZIP desde a última coleta; mantendo dados atuais dessa fonte.")
+    return False
+
+def coletar_inmet(forcar=False):
+    try:
+        url = _resolver_url_inmet(sessao_http)
+    except Exception as e:
+        log.error(f"Erro ao resolver URL do INMET: {e}")
+        return pd.DataFrame(), False
+
+    if not forcar and not precisa_baixar_inmet_novamente(sessao_http, url):
+        return pd.DataFrame(), False
+
+    log.info("Baixando ZIP do INMET (isso pode levar um tempo, o arquivo é grande)...")
+    try:
+        resposta = sessao_http.get(url, timeout=180)
+        resposta.raise_for_status()
         zip_file = zipfile.ZipFile(io.BytesIO(resposta.content))
         arquivos = zip_file.namelist()
         dados = []
@@ -158,19 +344,26 @@ def coletar_inmet():
                         df = pd.read_csv(
                             zip_file.open(arq),
                             sep=";", encoding="latin1",
-                            skiprows=8, low_memory=False
+                            skiprows=8, low_memory=False,
                         )
                         df.insert(0, "Estacao", f"INMET - {cidade}")
                         dados.append(df)
-                        print(f"OK: INMET - {cidade}")
+                        log.info(f"OK: INMET - {cidade}")
                     except Exception as e:
-                        print(f"Erro {cidade}: {e}")
+                        log.error(f"Erro ao processar estação {cidade}: {e}")
+
         if not dados:
-            return pd.DataFrame()
-        return pd.concat(dados, ignore_index=True)
+            return pd.DataFrame(), False
+
+        try:
+            _inmet_assinatura_cache[url] = _obter_assinatura_remota(sessao_http, url)
+        except Exception:
+            pass
+
+        return pd.concat(dados, ignore_index=True), True
     except Exception as e:
-        print(f"Erro ao baixar INMET: {e}")
-        return pd.DataFrame()
+        log.error(f"Erro ao baixar/processar ZIP do INMET: {e}")
+        return pd.DataFrame(), False
 
 def encontrar_coluna(colunas, *chaves):
     for col in colunas:
@@ -180,76 +373,105 @@ def encontrar_coluna(colunas, *chaves):
     return None
 
 # ==========================================================
-# MONTAR TABELA UNIFICADA
-# ==========================================================
-
-def montar_tabela():
-    df_hora  = coletar_om_horario()
-    df_prev  = coletar_om_diario()
-    df_inmet = coletar_inmet()
-    partes = [df for df in [df_hora, df_prev, df_inmet] if not df.empty]
-    if not partes:
-        return pd.DataFrame()
-    tabela = pd.concat(partes, ignore_index=True)
-    cols = ["Estacao"] + [c for c in tabela.columns if c != "Estacao"]
-    return tabela[cols]
-
-# ==========================================================
 # ESTADO COMPARTILHADO
 # ==========================================================
 
 tabela             = pd.DataFrame()
 tabela_lock        = threading.Lock()
 ultima_atualizacao = None
+_ultimo_bloco_inmet = pd.DataFrame()
+
+# ==========================================================
+# MONTAR TABELA UNIFICADA
+# ==========================================================
+
+def montar_tabela():
+    global _ultimo_bloco_inmet
+
+    df_hora    = coletar_om_horario()
+    df_prev    = coletar_om_diario()
+    df_estacao = coletar_estacao_meteorologica()
+
+    df_inmet_novo, inmet_mudou = coletar_inmet()
+    if inmet_mudou and not df_inmet_novo.empty:
+        _ultimo_bloco_inmet = df_inmet_novo
+    df_inmet = _ultimo_bloco_inmet
+
+    partes = [df for df in [df_hora, df_prev, df_estacao, df_inmet] if not df.empty]
+    if not partes:
+        return pd.DataFrame()
+
+    tabela_montada = pd.concat(partes, ignore_index=True)
+    cols = ["Estacao"] + [c for c in tabela_montada.columns if c != "Estacao"]
+    return tabela_montada[cols]
 
 # ==========================================================
 # GOOGLE SHEETS
 # ==========================================================
 
-def exportar_para_sheets(df):
-    if df.empty:
-        return
-    try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-    except ImportError:
-        print("AVISO: gspread/google-auth não instalados. Verifique o requirements.txt.")
-        return
+_hash_abas_enviadas = {}
 
-    if not os.path.exists(GSHEETS_CREDENCIAIS):
-        print(f"AVISO: credenciais não encontradas em {GSHEETS_CREDENCIAIS}. "
-              f"Configure o Secret File no Render.")
+def _hash_dataframe(df):
+    return pd.util.hash_pandas_object(df.fillna("—").astype(str)).sum()
+
+def _escrever_aba_com_retry(sh, nome_aba, dados, tentativas=3):
+    import gspread
+
+    novo_hash = _hash_dataframe(dados)
+    if _hash_abas_enviadas.get(nome_aba) == novo_hash:
+        log.info(f"Aba '{nome_aba}' sem mudanças; pulando escrita no Sheets.")
         return
 
-    try:
-        escopos = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_file(GSHEETS_CREDENCIAIS, scopes=escopos)
-        gc    = gspread.authorize(creds)
-        sh    = gc.open(GSHEETS_NOME)
+    dados_str = dados.fillna("—").astype(str)
+    linhas    = [dados_str.columns.tolist()] + dados_str.values.tolist()
 
-        def escrever_aba(nome_aba, dados):
-            dados_str = dados.fillna("—").astype(str)
-            linhas    = [dados_str.columns.tolist()] + dados_str.values.tolist()
+    for tentativa in range(1, tentativas + 1):
+        try:
             try:
                 ws = sh.worksheet(nome_aba)
                 ws.clear()
             except gspread.exceptions.WorksheetNotFound:
                 ws = sh.add_worksheet(title=nome_aba, rows=len(linhas) + 10, cols=len(dados_str.columns))
             ws.update(linhas)
+            _hash_abas_enviadas[nome_aba] = novo_hash
+            return
+        except gspread.exceptions.APIError as e:
+            espera = 5 * tentativa
+            log.warning(f"Rate limit/erro do Sheets na aba '{nome_aba}' (tentativa {tentativa}/{tentativas}); "
+                        f"aguardando {espera}s... ({e})")
+            time.sleep(espera)
+        except Exception as e:
+            log.error(f"Erro inesperado ao escrever aba '{nome_aba}': {e}")
+            return
+    log.error(f"Falha ao escrever aba '{nome_aba}' após {tentativas} tentativas.")
 
-        escrever_aba("Todas", df)
+def exportar_para_sheets(df):
+    if df.empty:
+        return
+    try:
+        import gspread  # noqa: F401 (garante que a lib está instalada)
+    except ImportError:
+        log.warning("gspread/google-auth não instalados. Verifique o requirements.txt.")
+        return
+
+    if not os.path.exists(GSHEETS_CREDENCIAIS):
+        log.warning(f"Credenciais não encontradas em {GSHEETS_CREDENCIAIS}. Configure o Secret File no Render.")
+        return
+
+    try:
+        gc = _obter_cliente_gspread()
+        sh = gc.open(GSHEETS_NOME)
+
+        _escrever_aba_com_retry(sh, "Todas", df)
 
         for fonte in df["Estacao"].unique():
             df_f = df[df["Estacao"] == fonte]
             cols = [c for c in df.columns if df_f[c].notna().any()]
-            escrever_aba(fonte[:100], df_f[cols])
+            _escrever_aba_com_retry(sh, fonte[:100], df_f[cols])
 
-        print(f"✅ Google Sheets atualizado: '{GSHEETS_NOME}'")
+        log.info(f"Google Sheets sincronizado: '{GSHEETS_NOME}'")
     except Exception as e:
-        print(f"Erro ao exportar para Google Sheets: {e}")
+        log.error(f"Erro ao exportar para Google Sheets: {e}")
 
 # ==========================================================
 # ATUALIZAÇÃO DE DADOS
@@ -257,15 +479,15 @@ def exportar_para_sheets(df):
 
 def atualizar_dados():
     global tabela, ultima_atualizacao
-    print(f"\n[{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}] Iniciando atualização dos dados...")
+    log.info("Iniciando ciclo de atualização dos dados...")
     nova_tabela = montar_tabela()
     with tabela_lock:
         if not nova_tabela.empty:
             tabela = nova_tabela
             ultima_atualizacao = datetime.now()
-            print(f"Atualização concluída: {len(tabela)} registros.")
+            log.info(f"Atualização concluída: {len(tabela)} registros.")
         else:
-            print("A atualização não trouxe dados novos; mantendo a tabela anterior.")
+            log.warning("A atualização não trouxe dados novos; mantendo a tabela anterior.")
 
     if GSHEETS_ATIVO:
         with tabela_lock:
@@ -283,11 +505,14 @@ def proxima_execucao():
 
 def agendador():
     while True:
-        alvo    = proxima_execucao()
+        alvo     = proxima_execucao()
         segundos = (alvo - datetime.now()).total_seconds()
-        print(f"Próxima atualização automática agendada para {alvo.strftime('%d/%m/%Y às %H:%M')}")
+        log.info(f"Próxima atualização automática agendada para {alvo.strftime('%d/%m/%Y às %H:%M')}")
         time.sleep(max(segundos, 1))
-        atualizar_dados()
+        try:
+            atualizar_dados()
+        except Exception as e:
+            log.error(f"Erro inesperado no ciclo de atualização: {e}")
 
 # ==========================================================
 # FLASK
@@ -323,6 +548,7 @@ def inicio():
     icones = {
         "Open-Meteo – Hoje (horário)":      "🕐",
         "Open-Meteo – Previsão (diária)":   "📅",
+        "Estação Meteorológica":            "🌡️",
         "INMET - Cachoeira do Sul":         "📡",
         "INMET - Santa Maria Automática":   "📡",
         "INMET - Santa Maria Convencional": "📡",
@@ -376,11 +602,12 @@ def inicio():
         .btn-ativo  {{ border-color: #222 !important; }}
         .btn-todas  {{ background: #e0e0e0; color: #333; }}
 
-        .src-om-hora   {{ background: #B3E5FC; color: #01579B; }}
-        .src-om-prev   {{ background: #C5CAE9; color: #1A237E; }}
-        .src-cachoeira {{ background: #C8E6C9; color: #1B5E20; }}
-        .src-sm-auto   {{ background: #FFF9C4; color: #E65100; }}
-        .src-sm-conv   {{ background: #F8BBD0; color: #880E4F; }}
+        .src-om-hora        {{ background: #B3E5FC; color: #01579B; }}
+        .src-om-prev        {{ background: #C5CAE9; color: #1A237E; }}
+        .src-estacao-meteo  {{ background: #FFE0B2; color: #E65100; }}
+        .src-cachoeira      {{ background: #C8E6C9; color: #1B5E20; }}
+        .src-sm-auto        {{ background: #FFF9C4; color: #E65100; }}
+        .src-sm-conv        {{ background: #F8BBD0; color: #880E4F; }}
 
         .wrapper {{ overflow-x: auto; }}
         table    {{ border-collapse: collapse; width: 100%; font-size: 12px; background: white; min-width: 900px; }}
@@ -390,11 +617,12 @@ def inicio():
         }}
         td {{ border: 1px solid #ddd; padding: 5px 6px; text-align: center; white-space: nowrap; }}
 
-        tr.src-om-hora   td {{ background: #E1F5FE; }}
-        tr.src-om-prev   td {{ background: #E8EAF6; }}
-        tr.src-cachoeira td {{ background: #E8F5E9; }}
-        tr.src-sm-auto   td {{ background: #FFFDE7; }}
-        tr.src-sm-conv   td {{ background: #FCE4EC; }}
+        tr.src-om-hora       td {{ background: #E1F5FE; }}
+        tr.src-om-prev       td {{ background: #E8EAF6; }}
+        tr.src-estacao-meteo td {{ background: #FFF3E0; }}
+        tr.src-cachoeira     td {{ background: #E8F5E9; }}
+        tr.src-sm-auto       td {{ background: #FFFDE7; }}
+        tr.src-sm-conv       td {{ background: #FCE4EC; }}
     </style>
 </head>
 <body>
@@ -424,6 +652,12 @@ def status():
     """Endpoint simples para checar se o servidor está vivo (útil para keep-alive)."""
     return {"ok": True, "ultima_atualizacao": str(ultima_atualizacao)}
 
+@app.route("/atualizar")
+def forcar_atualizacao():
+    """Dispara uma atualização manual (útil para testar sem esperar o agendador)."""
+    threading.Thread(target=atualizar_dados, daemon=True).start()
+    return {"ok": True, "mensagem": "Atualização disparada em segundo plano."}
+
 def gerar_linhas(df):
     html = ""
     for _, row in df.iterrows():
@@ -438,17 +672,13 @@ def gerar_linhas(df):
 # ==========================================================
 
 if __name__ == "__main__":
-    print("Buscando dados iniciais...")
+    log.info("Buscando dados iniciais...")
     atualizar_dados()
 
-    # Agendador automático (roda em segundo plano, dentro do mesmo processo)
     threading.Thread(target=agendador, daemon=True).start()
 
     porta = int(os.environ.get("PORT", 5000))
-    print(f"Servidor iniciado na porta {porta}")
+    log.info(f"Servidor iniciado na porta {porta}")
     if GSHEETS_ATIVO:
-        print(f"\n{'='*60}")
-        print(f"📊 PLANILHA GOOGLE SHEETS:")
-        print(f"   {GSHEETS_LINK}")
-        print(f"{'='*60}\n")
+        log.info(f"PLANILHA GOOGLE SHEETS: {GSHEETS_LINK}")
     app.run(host="0.0.0.0", port=porta, threaded=True)
