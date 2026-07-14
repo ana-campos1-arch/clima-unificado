@@ -276,19 +276,18 @@ def coletar_estacao_meteorologica():
         return pd.DataFrame()
 
 # ==========================================================
-# INMET — verificação inteligente + fallback de ano
+# INMET — verificação inteligente (por hash do conteúdo) + fallback de ano
 # ==========================================================
+#
+# NOTA: a checagem por cabeçalhos HTTP (Last-Modified/Content-Length via
+# HEAD) foi trocada por comparação de hash do conteúdo real baixado.
+# O servidor do INMET nem sempre devolve esses cabeçalhos de forma
+# confiável, o que fazia o script achar que "nada mudou" pra sempre,
+# mesmo quando o arquivo tinha novidade. Comparar o hash do conteúdo
+# baixado não depende disso e nunca trava silenciosamente.
 
-_inmet_assinatura_cache = {}
+_inmet_hash_cache = {}
 _inmet_url_ativa = None
-
-def _obter_assinatura_remota(sessao, url):
-    resp = sessao.head(url, timeout=30, allow_redirects=True)
-    resp.raise_for_status()
-    return (
-        resp.headers.get("Last-Modified"),
-        resp.headers.get("Content-Length"),
-    )
 
 def _resolver_url_inmet(sessao):
     global _inmet_url_ativa
@@ -305,36 +304,39 @@ def _resolver_url_inmet(sessao):
             log.warning(f"ZIP do INMET para {ano} indisponível, tentando outro ano...")
     raise RuntimeError("Nenhum ZIP do INMET disponível (ano atual nem anterior).")
 
-def precisa_baixar_inmet_novamente(sessao, url):
-    try:
-        assinatura_atual = _obter_assinatura_remota(sessao, url)
-    except Exception as e:
-        log.warning(f"Não foi possível checar cabeçalhos do INMET ({e}); vou baixar por precaução.")
-        return True
-
-    assinatura_anterior = _inmet_assinatura_cache.get(url)
-    if assinatura_anterior != assinatura_atual:
-        log.info(f"INMET tem dados novos (assinatura mudou: {assinatura_anterior} → {assinatura_atual}).")
-        return True
-
-    log.info("INMET ainda não atualizou o ZIP desde a última coleta; mantendo dados atuais dessa fonte.")
-    return False
-
 def coletar_inmet(forcar=False):
+    """
+    Baixa o ZIP do INMET e só reprocessa as estações se o CONTEÚDO do
+    arquivo mudou desde a última vez (comparado por hash SHA-256).
+    Retorna: (DataFrame, houve_atualizacao: bool)
+    """
+    import hashlib
+
     try:
         url = _resolver_url_inmet(sessao_http)
     except Exception as e:
         log.error(f"Erro ao resolver URL do INMET: {e}")
         return pd.DataFrame(), False
 
-    if not forcar and not precisa_baixar_inmet_novamente(sessao_http, url):
-        return pd.DataFrame(), False
-
-    log.info("Baixando ZIP do INMET (isso pode levar um tempo, o arquivo é grande)...")
+    log.info("Baixando ZIP do INMET para checagem (isso pode levar um tempo, o arquivo é grande)...")
     try:
         resposta = sessao_http.get(url, timeout=180)
         resposta.raise_for_status()
-        zip_file = zipfile.ZipFile(io.BytesIO(resposta.content))
+        conteudo = resposta.content
+    except Exception as e:
+        log.error(f"Erro ao baixar ZIP do INMET: {e}")
+        return pd.DataFrame(), False
+
+    hash_atual = hashlib.sha256(conteudo).hexdigest()
+    hash_anterior = _inmet_hash_cache.get(url)
+
+    if not forcar and hash_anterior == hash_atual:
+        log.info("INMET: conteúdo do ZIP é idêntico ao da última coleta; mantendo dados atuais dessa fonte.")
+        return pd.DataFrame(), False
+
+    log.info(f"INMET tem dados novos (hash mudou: {str(hash_anterior)[:10]}... → {hash_atual[:10]}...). Reprocessando...")
+    try:
+        zip_file = zipfile.ZipFile(io.BytesIO(conteudo))
         arquivos = zip_file.namelist()
         dados = []
         for codigo, cidade in ESTACOES.items():
@@ -355,14 +357,10 @@ def coletar_inmet(forcar=False):
         if not dados:
             return pd.DataFrame(), False
 
-        try:
-            _inmet_assinatura_cache[url] = _obter_assinatura_remota(sessao_http, url)
-        except Exception:
-            pass
-
+        _inmet_hash_cache[url] = hash_atual
         return pd.concat(dados, ignore_index=True), True
     except Exception as e:
-        log.error(f"Erro ao baixar/processar ZIP do INMET: {e}")
+        log.error(f"Erro ao processar ZIP do INMET: {e}")
         return pd.DataFrame(), False
 
 def encontrar_coluna(colunas, *chaves):
