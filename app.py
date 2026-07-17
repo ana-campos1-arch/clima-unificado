@@ -18,23 +18,23 @@
 #
 # O QUE MUDOU NESTA VERSÃO
 # ─────────────────────────────────────────────────────────
-#  • O INMET publica um ZIP HISTÓRICO ANUAL, não um feed em
-#    tempo real. Antes de baixar de novo (arquivo grande),
-#    o script agora faz um HEAD request e compara o
-#    Last-Modified / tamanho do arquivo com o que já foi
-#    processado. Só baixa e reprocessa se algo mudou de
-#    fato — é isso que faz o comportamento "parecer" com o
-#    Open-Meteo: ele busca a cada execução, mas só troca os
-#    dados quando existe novidade real na fonte.
-#  • Se o ZIP do ano corrente ainda não existir no INMET
-#    (comum no início de janeiro), cai automaticamente para
-#    o ZIP do ano anterior.
-#  • Chamadas de rede (Open-Meteo, INMET, Google Sheets) têm
-#    retries com backoff exponencial.
+#  • MUDANÇA PRINCIPAL: o INMET agora é coletado pela API de TEMPO REAL
+#    (apitempo.inmet.gov.br), que devolve dado hora a hora direto da
+#    estação — assim como o Open-Meteo. O ZIP histórico anual (que passa
+#    por controle de qualidade e fica 1-3 semanas atrasado) só entra
+#    como RESERVA automática, caso a API de tempo real esteja fora do
+#    ar ou pare de responder para todas as estações.
+#  • O caminho de reserva (ZIP) continua comparando por HASH do
+#    conteúdo baixado (não cabeçalhos HTTP, que não são confiáveis).
+#  • Se o ZIP do ano corrente ainda não existir no INMET (comum no
+#    início de janeiro), o caminho de reserva cai para o ano anterior.
+#  • Chamadas de rede (Open-Meteo, INMET, Google Sheets) têm retries
+#    com backoff exponencial.
 #  • Logging estruturado (nível, hora) no lugar de print().
-#  • Google Sheets só reescreve uma aba se os dados dela
-#    realmente mudaram (evita bater no limite de requisições
-#    da API e deixa a atualização mais rápida).
+#  • Google Sheets só reescreve uma aba se os dados dela realmente
+#    mudaram (evita bater no limite de requisições da API).
+#  • /status mostra a data/hora mais recente de cada fonte de dados,
+#    reconhecendo tanto os nomes de coluna do ZIP quanto da API.
 # ==========================================================
 
 import io
@@ -78,9 +78,11 @@ ESTACOES = {
 ANO_ATUAL = date.today().year
 URL_INMET_BASE = "https://portal.inmet.gov.br/uploads/dadoshistoricos/{ano}.zip"
 
-# De quantas em quantas horas o ciclo de atualização roda.
-# (Note: rodar o ciclo não significa necessariamente baixar o ZIP do INMET
-# de novo — veja "precisa_baixar_inmet_novamente" abaixo.)
+# De quantas em quantas horas o ciclo de atualização roda. Vale tanto para
+# Open-Meteo quanto para o INMET, já que agora o INMET usa a API de tempo
+# real (hora a hora), no mesmo ritmo do Open-Meteo. O ZIP histórico anual
+# só entra como reserva automática se a API do INMET falhar (veja a seção
+# "INMET" mais abaixo).
 INTERVALO_ATUALIZACAO_HORAS = 1
 
 # ── Google Sheets ────────────────────────────────────────
@@ -276,65 +278,107 @@ def coletar_estacao_meteorologica():
         return pd.DataFrame()
 
 # ==========================================================
-# INMET — verificação inteligente (por hash do conteúdo) + fallback de ano
+# INMET — API de tempo real (fonte principal) + ZIP anual (reserva)
 # ==========================================================
 #
-# NOTA: a checagem por cabeçalhos HTTP (Last-Modified/Content-Length via
-# HEAD) foi trocada por comparação de hash do conteúdo real baixado.
-# O servidor do INMET nem sempre devolve esses cabeçalhos de forma
-# confiável, o que fazia o script achar que "nada mudou" pra sempre,
-# mesmo quando o arquivo tinha novidade. Comparar o hash do conteúdo
-# baixado não depende disso e nunca trava silenciosamente.
+# O INMET tem duas fontes bem diferentes:
+#   1) API de tempo real (apitempo.inmet.gov.br) — dado hora a hora,
+#      direto da estação, sem passar pelo controle de qualidade demorado.
+#      É esta que faz o INMET atualizar "como o Open-Meteo".
+#   2) ZIP histórico anual (dadoshistoricos) — passa por controle de
+#      qualidade, por isso fica 1-3 semanas atrasado. Usado aqui só como
+#      RESERVA, caso a API de tempo real esteja fora do ar ou tenha
+#      mudado de contrato (isso já aconteceu antes com bibliotecas que
+#      dependem dela, então a checagem por hash de conteúdo continua
+#      valendo para esse caminho de reserva).
 
-_inmet_hash_cache = {}
-_inmet_url_ativa = None
+URL_INMET_API_BASE = "https://apitempo.inmet.gov.br/estacao/{inicio}/{fim}/{codigo}"
 
-def _resolver_url_inmet(sessao):
-    global _inmet_url_ativa
+def coletar_inmet_api():
+    """
+    Busca o dado hora a hora mais recente de cada estação via API de
+    tempo real do INMET. Pede os últimos 2 dias (não só "hoje") como
+    margem de segurança contra atraso de transmissão da estação/fuso.
+    Retorna um DataFrame vazio se a API não responder para NENHUMA
+    estação (sinal de que ela pode estar fora do ar/mudou de contrato).
+    """
+    hoje    = date.today()
+    inicio  = (hoje - timedelta(days=2)).isoformat()
+    fim     = hoje.isoformat()
+
+    blocos = []
+    for codigo, cidade in ESTACOES.items():
+        url = URL_INMET_API_BASE.format(inicio=inicio, fim=fim, codigo=codigo)
+        try:
+            resp = sessao_http.get(url, timeout=30)
+            resp.raise_for_status()
+            registros = resp.json()
+            if not registros or not isinstance(registros, list):
+                log.warning(f"API de tempo real do INMET sem dados para {cidade} ({codigo}) no período pedido.")
+                continue
+            df = pd.DataFrame(registros)
+            if df.empty:
+                continue
+            df.insert(0, "Estacao", f"INMET - {cidade}")
+            blocos.append(df)
+            log.info(f"OK: INMET (API tempo real) - {cidade}: {len(df)} registros")
+        except Exception as e:
+            log.warning(f"Erro ao consultar API de tempo real do INMET para {cidade} ({codigo}): {e}")
+
+    if not blocos:
+        return pd.DataFrame()
+    return pd.concat(blocos, ignore_index=True)
+
+# ── Reserva: ZIP histórico anual, com checagem por hash de conteúdo ──
+
+_inmet_zip_hash_cache = {}
+_inmet_zip_url_ativa  = None
+
+def _resolver_url_inmet_zip(sessao):
+    global _inmet_zip_url_ativa
     candidatos = [ANO_ATUAL, ANO_ATUAL - 1]
     for ano in candidatos:
         url = URL_INMET_BASE.format(ano=ano)
         try:
             sessao.head(url, timeout=30, allow_redirects=True).raise_for_status()
-            if _inmet_url_ativa != url:
-                log.info(f"Usando ZIP do INMET: {ano}")
-            _inmet_url_ativa = url
+            if _inmet_zip_url_ativa != url:
+                log.info(f"Usando ZIP do INMET (reserva): {ano}")
+            _inmet_zip_url_ativa = url
             return url
         except Exception:
             log.warning(f"ZIP do INMET para {ano} indisponível, tentando outro ano...")
     raise RuntimeError("Nenhum ZIP do INMET disponível (ano atual nem anterior).")
 
-def coletar_inmet(forcar=False):
+def coletar_inmet_zip_reserva(forcar=False):
     """
-    Baixa o ZIP do INMET e só reprocessa as estações se o CONTEÚDO do
-    arquivo mudou desde a última vez (comparado por hash SHA-256).
-    Retorna: (DataFrame, houve_atualizacao: bool)
+    Caminho de reserva: baixa o ZIP histórico anual e só reprocessa se o
+    CONTEÚDO mudou (hash SHA-256) desde a última vez. Só é chamado quando
+    a API de tempo real falha para todas as estações.
     """
     import hashlib
 
     try:
-        url = _resolver_url_inmet(sessao_http)
+        url = _resolver_url_inmet_zip(sessao_http)
     except Exception as e:
-        log.error(f"Erro ao resolver URL do INMET: {e}")
-        return pd.DataFrame(), False
+        log.error(f"Erro ao resolver URL do ZIP do INMET: {e}")
+        return pd.DataFrame()
 
-    log.info("Baixando ZIP do INMET para checagem (isso pode levar um tempo, o arquivo é grande)...")
+    log.info("Baixando ZIP do INMET (reserva) para checagem...")
     try:
         resposta = sessao_http.get(url, timeout=180)
         resposta.raise_for_status()
         conteudo = resposta.content
     except Exception as e:
-        log.error(f"Erro ao baixar ZIP do INMET: {e}")
-        return pd.DataFrame(), False
+        log.error(f"Erro ao baixar ZIP do INMET (reserva): {e}")
+        return pd.DataFrame()
 
-    hash_atual = hashlib.sha256(conteudo).hexdigest()
-    hash_anterior = _inmet_hash_cache.get(url)
+    hash_atual    = hashlib.sha256(conteudo).hexdigest()
+    hash_anterior = _inmet_zip_hash_cache.get(url)
 
     if not forcar and hash_anterior == hash_atual:
-        log.info("INMET: conteúdo do ZIP é idêntico ao da última coleta; mantendo dados atuais dessa fonte.")
-        return pd.DataFrame(), False
+        log.info("INMET (reserva): conteúdo do ZIP idêntico ao da última coleta.")
+        return pd.DataFrame()
 
-    log.info(f"INMET tem dados novos (hash mudou: {str(hash_anterior)[:10]}... → {hash_atual[:10]}...). Reprocessando...")
     try:
         zip_file = zipfile.ZipFile(io.BytesIO(conteudo))
         arquivos = zip_file.namelist()
@@ -350,18 +394,34 @@ def coletar_inmet(forcar=False):
                         )
                         df.insert(0, "Estacao", f"INMET - {cidade}")
                         dados.append(df)
-                        log.info(f"OK: INMET - {cidade}")
+                        log.info(f"OK: INMET (reserva/ZIP) - {cidade}")
                     except Exception as e:
-                        log.error(f"Erro ao processar estação {cidade}: {e}")
+                        log.error(f"Erro ao processar estação {cidade} (reserva/ZIP): {e}")
 
         if not dados:
-            return pd.DataFrame(), False
+            return pd.DataFrame()
 
-        _inmet_hash_cache[url] = hash_atual
-        return pd.concat(dados, ignore_index=True), True
+        _inmet_zip_hash_cache[url] = hash_atual
+        return pd.concat(dados, ignore_index=True)
     except Exception as e:
-        log.error(f"Erro ao processar ZIP do INMET: {e}")
-        return pd.DataFrame(), False
+        log.error(f"Erro ao processar ZIP do INMET (reserva): {e}")
+        return pd.DataFrame()
+
+def coletar_inmet(forcar=False):
+    """
+    Ponto de entrada único usado por montar_tabela(). Tenta a API de
+    tempo real primeiro (dado hora a hora). Se ela não devolver nada
+    para nenhuma estação, cai automaticamente para o ZIP histórico como
+    reserva. Retorna: (DataFrame, houve_atualizacao: bool)
+    """
+    df_api = coletar_inmet_api()
+    if not df_api.empty:
+        return df_api, True
+
+    log.warning("API de tempo real do INMET não retornou dados para nenhuma estação; "
+                "usando ZIP histórico como reserva.")
+    df_zip = coletar_inmet_zip_reserva(forcar=forcar)
+    return df_zip, (not df_zip.empty)
 
 def encontrar_coluna(colunas, *chaves):
     for col in colunas:
@@ -383,16 +443,29 @@ _ultimo_bloco_inmet = pd.DataFrame()
 # MONTAR TABELA UNIFICADA
 # ==========================================================
 
-def montar_tabela():
+def montar_tabela(forcar_inmet=False):
+    """
+    forcar_inmet: repassado para o caminho de reserva (ZIP anual), caso a
+    API de tempo real esteja indisponível — ignora o cache de hash e força
+    reprocessar o ZIP. Não tem efeito quando a API de tempo real responde
+    normalmente (que é o caso mais comum).
+    """
     global _ultimo_bloco_inmet
 
     df_hora    = coletar_om_horario()
     df_prev    = coletar_om_diario()
     df_estacao = coletar_estacao_meteorologica()
 
-    df_inmet_novo, inmet_mudou = coletar_inmet()
+    # A API de tempo real do INMET traz dado hora a hora, então é checada
+    # a cada ciclo — igual o Open-Meteo. Se ela falhar, coletar_inmet()
+    # cai sozinha para o ZIP anual como reserva (esse sim mais raro de
+    # mudar, mas ainda assim comparado por hash pra não reprocessar à toa).
+    df_inmet_novo, inmet_mudou = coletar_inmet(forcar=forcar_inmet)
     if inmet_mudou and not df_inmet_novo.empty:
         _ultimo_bloco_inmet = df_inmet_novo
+    else:
+        log.info("INMET: usando o último bloco de dados válido dessa fonte (nenhuma novidade neste ciclo).")
+
     df_inmet = _ultimo_bloco_inmet
 
     partes = [df for df in [df_hora, df_prev, df_estacao, df_inmet] if not df.empty]
@@ -475,10 +548,10 @@ def exportar_para_sheets(df):
 # ATUALIZAÇÃO DE DADOS
 # ==========================================================
 
-def atualizar_dados():
+def atualizar_dados(forcar_inmet=False):
     global tabela, ultima_atualizacao
     log.info("Iniciando ciclo de atualização dos dados...")
-    nova_tabela = montar_tabela()
+    nova_tabela = montar_tabela(forcar_inmet=forcar_inmet)
     with tabela_lock:
         if not nova_tabela.empty:
             tabela = nova_tabela
@@ -645,16 +718,70 @@ def inicio():
 </body>
 </html>"""
 
+def _data_mais_recente_por_fonte(df):
+    """
+    Para cada fonte na tabela, tenta achar a data/hora mais recente presente
+    nos dados. Reconhece tanto os nomes de coluna do ZIP histórico
+    ('Data', 'Hora') quanto os da API de tempo real do INMET
+    ('DT_MEDICAO', 'HR_MEDICAO'). Usado só para diagnóstico no /status —
+    não afeta a lógica de coleta/atualização.
+    """
+    resultado = {}
+    if df.empty:
+        return resultado
+
+    for fonte in df["Estacao"].unique():
+        df_f = df[df["Estacao"] == fonte]
+        col_data = encontrar_coluna(df_f.columns, "DATA") or encontrar_coluna(df_f.columns, "DT", "MEDICAO")
+        if col_data is None:
+            resultado[fonte] = "coluna de data não encontrada"
+            continue
+        try:
+            valores_data = df_f[col_data].astype(str)
+            col_hora = encontrar_coluna(df_f.columns, "HORA") or encontrar_coluna(df_f.columns, "HR", "MEDICAO")
+            if col_hora is not None:
+                valores = (valores_data + " " + df_f[col_hora].astype(str)).tolist()
+            else:
+                valores = valores_data.tolist()
+            resultado[fonte] = max(valores) if valores else "sem dados"
+        except Exception as e:
+            resultado[fonte] = f"erro ao calcular: {e}"
+    return resultado
+
 @app.route("/status")
 def status():
-    """Endpoint simples para checar se o servidor está vivo (útil para keep-alive)."""
-    return {"ok": True, "ultima_atualizacao": str(ultima_atualizacao)}
+    """
+    Endpoint para checar se o servidor está vivo (útil para keep-alive) e,
+    mais importante: mostra a data/hora mais recente presente em cada
+    fonte de dados. Use isso pra confirmar rapidamente se o INMET está
+    atrasado na fonte (limitação deles) ou se o app parou de atualizar
+    (bug/deploy), sem precisar abrir o Sheets ou os Logs do Render.
+    """
+    with tabela_lock:
+        df_atual = tabela.copy()
+    return {
+        "ok": True,
+        "ultima_atualizacao_do_app": str(ultima_atualizacao),
+        "dado_mais_recente_por_fonte": _data_mais_recente_por_fonte(df_atual),
+        "total_registros": len(df_atual),
+    }
 
 @app.route("/atualizar")
 def forcar_atualizacao():
-    """Dispara uma atualização manual (útil para testar sem esperar o agendador)."""
-    threading.Thread(target=atualizar_dados, daemon=True).start()
-    return {"ok": True, "mensagem": "Atualização disparada em segundo plano."}
+    """
+    Dispara uma atualização manual (útil para testar sem esperar o agendador).
+    O INMET agora usa a API de tempo real a cada ciclo, então normalmente
+    não precisa de nenhum parâmetro especial. Use /atualizar?inmet=1 apenas
+    se quiser forçar o caminho de RESERVA (ZIP anual) a ignorar o cache de
+    hash e reprocessar mesmo sem mudança — útil só se a API de tempo real
+    estiver fora do ar e você quiser testar o fallback.
+    """
+    forcar_inmet = flask_request.args.get("inmet") == "1"
+    threading.Thread(target=atualizar_dados, kwargs={"forcar_inmet": forcar_inmet}, daemon=True).start()
+    mensagem = "Atualização disparada em segundo plano."
+    if forcar_inmet:
+        mensagem += " Cache de reserva (ZIP) forçado a reprocessar, se for usado."
+    return {"ok": True, "mensagem": mensagem}
 
 def gerar_linhas(df):
     html = ""
