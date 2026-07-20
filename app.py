@@ -169,9 +169,12 @@ def coletar_om_horario():
                 "Cód. Clima":       h["weather_code"][i],
             })
         log.info(f"OK: {len(linhas)} horas do dia de hoje (Open-Meteo)")
-        return pd.DataFrame(linhas)
+        df = pd.DataFrame(linhas)
+        _marcar_diagnostico("Open-Meteo – Hoje (horário)", True, len(df))
+        return df
     except Exception as e:
         log.error(f"Erro Open-Meteo horário: {e}")
+        _marcar_diagnostico("Open-Meteo – Hoje (horário)", False, 0, str(e))
         return pd.DataFrame()
 
 # ==========================================================
@@ -207,9 +210,12 @@ def coletar_om_diario():
                 "Pôr do Sol":        d["sunset"][i],
             })
         log.info(f"OK: {len(linhas)} dias de previsão (Open-Meteo)")
-        return pd.DataFrame(linhas)
+        df = pd.DataFrame(linhas)
+        _marcar_diagnostico("Open-Meteo – Previsão (diária)", True, len(df))
+        return df
     except Exception as e:
         log.error(f"Erro Open-Meteo diário: {e}")
+        _marcar_diagnostico("Open-Meteo – Previsão (diária)", False, 0, str(e))
         return pd.DataFrame()
 
 # ==========================================================
@@ -272,9 +278,11 @@ def coletar_estacao_meteorologica():
         df = pd.DataFrame(registros)
         df.insert(0, "Estacao", "Estação Meteorológica")
         log.info(f"OK: {len(df)} registros da Estação Meteorológica")
+        _marcar_diagnostico("Estação Meteorológica", True, len(df))
         return df
     except Exception as e:
         log.error(f"Erro ao ler a planilha da Estação Meteorológica: {e}")
+        _marcar_diagnostico("Estação Meteorológica", False, 0, str(e))
         return pd.DataFrame()
 
 # ==========================================================
@@ -309,21 +317,26 @@ def coletar_inmet_api():
     blocos = []
     for codigo, cidade in ESTACOES.items():
         url = URL_INMET_API_BASE.format(inicio=inicio, fim=fim, codigo=codigo)
+        fonte_diag = f"INMET (API) - {cidade}"
         try:
             resp = sessao_http.get(url, timeout=30)
             resp.raise_for_status()
             registros = resp.json()
             if not registros or not isinstance(registros, list):
                 log.warning(f"API de tempo real do INMET sem dados para {cidade} ({codigo}) no período pedido.")
+                _marcar_diagnostico(fonte_diag, False, 0, "resposta vazia/sem lista")
                 continue
             df = pd.DataFrame(registros)
             if df.empty:
+                _marcar_diagnostico(fonte_diag, False, 0, "DataFrame vazio")
                 continue
             df.insert(0, "Estacao", f"INMET - {cidade}")
             blocos.append(df)
+            _marcar_diagnostico(fonte_diag, True, len(df))
             log.info(f"OK: INMET (API tempo real) - {cidade}: {len(df)} registros")
         except Exception as e:
             log.warning(f"Erro ao consultar API de tempo real do INMET para {cidade} ({codigo}): {e}")
+            _marcar_diagnostico(fonte_diag, False, 0, str(e))
 
     if not blocos:
         return pd.DataFrame()
@@ -416,11 +429,16 @@ def coletar_inmet(forcar=False):
     """
     df_api = coletar_inmet_api()
     if not df_api.empty:
+        _marcar_diagnostico("INMET (fonte usada)", True, len(df_api), "API de tempo real")
         return df_api, True
 
     log.warning("API de tempo real do INMET não retornou dados para nenhuma estação; "
                 "usando ZIP histórico como reserva.")
     df_zip = coletar_inmet_zip_reserva(forcar=forcar)
+    if not df_zip.empty:
+        _marcar_diagnostico("INMET (fonte usada)", True, len(df_zip), "ZIP histórico (reserva)")
+    else:
+        _marcar_diagnostico("INMET (fonte usada)", False, 0, "API e ZIP falharam/sem novidade")
     return df_zip, (not df_zip.empty)
 
 def encontrar_coluna(colunas, *chaves):
@@ -438,6 +456,46 @@ tabela             = pd.DataFrame()
 tabela_lock        = threading.Lock()
 ultima_atualizacao = None
 _ultimo_bloco_inmet = pd.DataFrame()
+
+# ==========================================================
+# DIAGNÓSTICO — registra o resultado de cada coleta, fonte a fonte
+# ==========================================================
+# Serve pra gerar a aba "Diagnóstico" no Sheets, que muda a cada ciclo
+# (tem timestamp), então é uma forma visual de confirmar que o app está
+# rodando de verdade, sem precisar abrir logs do Render.
+
+_diagnostico_lock = threading.Lock()
+_diagnostico = {}  # fonte -> {"ok": bool, "registros": int, "detalhe": str, "hora": datetime}
+
+def _marcar_diagnostico(fonte, ok, registros=0, detalhe=""):
+    with _diagnostico_lock:
+        _diagnostico[fonte] = {
+            "ok": ok,
+            "registros": registros,
+            "detalhe": detalhe,
+            "hora": datetime.now(),
+        }
+
+def montar_aba_diagnostico():
+    """Monta um DataFrame simples pra aba 'Diagnóstico' do Sheets."""
+    agora = datetime.now()
+    linhas = [{
+        "Fonte": "── ÚLTIMA EXECUÇÃO DO CICLO ──",
+        "Status": "🟢 RODANDO",
+        "Registros": "",
+        "Detalhe": f"Ciclo iniciado às {agora.strftime('%d/%m/%Y %H:%M:%S')}",
+        "Checado em": agora.strftime("%d/%m/%Y %H:%M:%S"),
+    }]
+    with _diagnostico_lock:
+        for fonte, info in sorted(_diagnostico.items()):
+            linhas.append({
+                "Fonte": fonte,
+                "Status": "✅ OK" if info["ok"] else "❌ FALHOU",
+                "Registros": info["registros"],
+                "Detalhe": info["detalhe"],
+                "Checado em": info["hora"].strftime("%d/%m/%Y %H:%M:%S"),
+            })
+    return pd.DataFrame(linhas)
 
 # ==========================================================
 # MONTAR TABELA UNIFICADA
@@ -485,11 +543,11 @@ _hash_abas_enviadas = {}
 def _hash_dataframe(df):
     return pd.util.hash_pandas_object(df.fillna("—").astype(str)).sum()
 
-def _escrever_aba_com_retry(sh, nome_aba, dados, tentativas=3):
+def _escrever_aba_com_retry(sh, nome_aba, dados, tentativas=3, pular_dedup=False):
     import gspread
 
     novo_hash = _hash_dataframe(dados)
-    if _hash_abas_enviadas.get(nome_aba) == novo_hash:
+    if not pular_dedup and _hash_abas_enviadas.get(nome_aba) == novo_hash:
         log.info(f"Aba '{nome_aba}' sem mudanças; pulando escrita no Sheets.")
         return
 
@@ -517,8 +575,6 @@ def _escrever_aba_com_retry(sh, nome_aba, dados, tentativas=3):
     log.error(f"Falha ao escrever aba '{nome_aba}' após {tentativas} tentativas.")
 
 def exportar_para_sheets(df):
-    if df.empty:
-        return
     try:
         import gspread  # noqa: F401 (garante que a lib está instalada)
     except ImportError:
@@ -532,6 +588,15 @@ def exportar_para_sheets(df):
     try:
         gc = _obter_cliente_gspread()
         sh = gc.open(GSHEETS_NOME)
+
+        # A aba Diagnóstico é escrita SEMPRE, mesmo se a tabela principal
+        # estiver vazia — é ela que prova visualmente que o ciclo rodou,
+        # porque tem um timestamp que muda a cada execução.
+        _escrever_aba_com_retry(sh, "Diagnóstico", montar_aba_diagnostico(), pular_dedup=True)
+
+        if df.empty:
+            log.warning("Tabela principal vazia; só a aba Diagnóstico foi atualizada neste ciclo.")
+            return
 
         _escrever_aba_com_retry(sh, "Todas", df)
 
