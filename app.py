@@ -35,6 +35,10 @@
 #    mudaram (evita bater no limite de requisições da API).
 #  • /status mostra a data/hora mais recente de cada fonte de dados,
 #    reconhecendo tanto os nomes de coluna do ZIP quanto da API.
+#  • NOVO: coleta de radiação solar (Open-Meteo hora a hora e previsão
+#    diária). Para o INMET e a Estação Meteorológica, a radiação já
+#    entra automaticamente se a fonte fornecer essa coluna — nada
+#    precisou mudar nesses dois caminhos.
 # ==========================================================
 
 import io
@@ -149,7 +153,7 @@ def coletar_om_horario():
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={LATITUDE}&longitude={LONGITUDE}"
         f"&hourly=temperature_2m,relative_humidity_2m,"
-        f"wind_speed_10m,precipitation,weather_code"
+        f"wind_speed_10m,precipitation,weather_code,shortwave_radiation"
         f"&start_date={hoje}&end_date={hoje}"
         f"&timezone=America/Sao_Paulo"
     )
@@ -167,6 +171,7 @@ def coletar_om_horario():
                 "Vento (km/h)":     h["wind_speed_10m"][i],
                 "Precip. (mm)":     h["precipitation"][i],
                 "Cód. Clima":       h["weather_code"][i],
+                "Radiação Solar (W/m²)": h["shortwave_radiation"][i],
             })
         log.info(f"OK: {len(linhas)} horas do dia de hoje (Open-Meteo)")
         df = pd.DataFrame(linhas)
@@ -188,7 +193,7 @@ def coletar_om_diario():
         f"latitude={LATITUDE}&longitude={LONGITUDE}"
         f"&daily=temperature_2m_max,temperature_2m_min,"
         f"precipitation_sum,wind_speed_10m_max,"
-        f"weather_code,sunrise,sunset"
+        f"weather_code,sunrise,sunset,shortwave_radiation_sum"
         f"&forecast_days=16"
         f"&timezone=America/Sao_Paulo"
     )
@@ -208,6 +213,7 @@ def coletar_om_diario():
                 "Cód. Clima":        d["weather_code"][i],
                 "Nascer do Sol":     d["sunrise"][i],
                 "Pôr do Sol":        d["sunset"][i],
+                "Radiação Solar (MJ/m²)": d["shortwave_radiation_sum"][i],
             })
         log.info(f"OK: {len(linhas)} dias de previsão (Open-Meteo)")
         df = pd.DataFrame(linhas)
@@ -262,6 +268,11 @@ def coletar_estacao_meteorologica():
     Leitor ou Editor) com o e-mail da mesma Service Account usada nas
     outras credenciais do Google Sheets — senão a leitura falha com erro
     de permissão.
+
+    Se a planilha da estação já tiver uma coluna de radiação solar (por
+    exemplo, vinda de um piranômetro/sensor físico), ela entra automati-
+    camente aqui junto com as demais colunas — não precisa de nenhuma
+    mudança neste trecho.
     """
     if not ESTACAO_METEO_SHEET_ID:
         return pd.DataFrame()
@@ -299,6 +310,12 @@ def coletar_estacao_meteorologica():
 #      mudado de contrato (isso já aconteceu antes com bibliotecas que
 #      dependem dela, então a checagem por hash de conteúdo continua
 #      valendo para esse caminho de reserva).
+#
+# Ambas as fontes do INMET já trazem sua própria coluna de radiação solar
+# global quando disponível (ex.: "RAD_GLO" na API de tempo real, ou
+# "RADIACAO GLOBAL (Kj/m²)" no ZIP histórico). Como o código abaixo só
+# repassa todas as colunas que a fonte devolve, essa radiação já aparece
+# na tabela unificada sem precisar de nenhuma alteração aqui.
 
 URL_INMET_API_BASE = "https://apitempo.inmet.gov.br/estacao/{inicio}/{fim}/{codigo}"
 
