@@ -121,7 +121,22 @@ FONTE_CSS = {
     "INMET - Santa Maria Automática":    "src-sm-auto",
     "INMET - Santa Maria Convencional":  "src-sm-conv",
     "Estação Meteorológica":             "src-estacao-meteo",
+    "Dados da Comunidade":               "src-comunidade",
 }
+
+# ── Dados da Comunidade (formulário público em /adicionar) ─────────
+# Qualquer pessoa com acesso ao site pode enviar seus próprios dados
+# meteorológicos pelo formulário público. Cada envio é gravado direto
+# numa aba própria ("Dados da Comunidade") dentro da MESMA planilha de
+# destino (GSHEETS_NOME) — não é uma planilha separada. Essa aba é
+# relida a cada ciclo (coletar_dados_comunidade) e entra na tabela
+# unificada, igual às outras fontes.
+DADOS_COMUNIDADE_ABA = "Dados da Comunidade"
+CAMPOS_COMUNIDADE = [
+    "Nome/Apelido", "Cidade/Bairro", "Data", "Hora",
+    "Temperatura (°C)", "Umidade (%RH)", "Vento (km/h)",
+    "Precip. (mm)", "Radiação Solar (W/m²)", "Observação",
+]
 
 # ==========================================================
 # SESSÃO HTTP COM RETRY/BACKOFF
@@ -295,6 +310,61 @@ def coletar_estacao_meteorologica():
         log.error(f"Erro ao ler a planilha da Estação Meteorológica: {e}")
         _marcar_diagnostico("Estação Meteorológica", False, 0, str(e))
         return pd.DataFrame()
+
+# ==========================================================
+# DADOS DA COMUNIDADE (formulário público em /adicionar)
+# ==========================================================
+
+def coletar_dados_comunidade():
+    """
+    Relê a aba "Dados da Comunidade" (mesma planilha de destino) e devolve
+    como DataFrame, para entrar junto na tabela unificada. Cada envio do
+    formulário público já grava direto nessa aba (ver _salvar_dado_comunidade
+    e a rota /adicionar); esta função só busca o que já está lá.
+    """
+    if not GSHEETS_ATIVO:
+        return pd.DataFrame()
+
+    import gspread
+
+    try:
+        gc = _obter_cliente_gspread()
+        sh = gc.open(GSHEETS_NOME)
+        try:
+            ws = sh.worksheet(DADOS_COMUNIDADE_ABA)
+        except gspread.exceptions.WorksheetNotFound:
+            return pd.DataFrame()
+        registros = ws.get_all_records()
+        if not registros:
+            return pd.DataFrame()
+        df = pd.DataFrame(registros)
+        df.insert(0, "Estacao", "Dados da Comunidade")
+        _marcar_diagnostico("Dados da Comunidade", True, len(df))
+        return df
+    except Exception as e:
+        log.error(f"Erro ao ler dados da comunidade: {e}")
+        _marcar_diagnostico("Dados da Comunidade", False, 0, str(e))
+        return pd.DataFrame()
+
+def _salvar_dado_comunidade(linha: dict):
+    """
+    Grava uma linha nova (append) na aba "Dados da Comunidade", criando a
+    aba com o cabeçalho se ainda não existir. Chamada pela rota /adicionar
+    quando alguém envia o formulário público.
+    """
+    if not GSHEETS_ATIVO:
+        raise RuntimeError("Google Sheets desativado; não é possível salvar envios do formulário.")
+
+    import gspread
+
+    gc = _obter_cliente_gspread()
+    sh = gc.open(GSHEETS_NOME)
+    try:
+        ws = sh.worksheet(DADOS_COMUNIDADE_ABA)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=DADOS_COMUNIDADE_ABA, rows=1000, cols=len(CAMPOS_COMUNIDADE))
+        ws.append_row(CAMPOS_COMUNIDADE)
+    ws.append_row([str(linha.get(campo, "")) for campo in CAMPOS_COMUNIDADE])
 
 # ==========================================================
 # INMET — API de tempo real (fonte principal) + ZIP anual (reserva)
@@ -527,9 +597,10 @@ def montar_tabela(forcar_inmet=False):
     """
     global _ultimo_bloco_inmet
 
-    df_hora    = coletar_om_horario()
-    df_prev    = coletar_om_diario()
-    df_estacao = coletar_estacao_meteorologica()
+    df_hora       = coletar_om_horario()
+    df_prev       = coletar_om_diario()
+    df_estacao    = coletar_estacao_meteorologica()
+    df_comunidade = coletar_dados_comunidade()
 
     # A API de tempo real do INMET traz dado hora a hora, então é checada
     # a cada ciclo — igual o Open-Meteo. Se ela falhar, coletar_inmet()
@@ -543,7 +614,7 @@ def montar_tabela(forcar_inmet=False):
 
     df_inmet = _ultimo_bloco_inmet
 
-    partes = [df for df in [df_hora, df_prev, df_estacao, df_inmet] if not df.empty]
+    partes = [df for df in [df_hora, df_prev, df_estacao, df_comunidade, df_inmet] if not df.empty]
     if not partes:
         return pd.DataFrame()
 
@@ -702,6 +773,7 @@ def inicio():
         "Open-Meteo – Hoje (horário)":      "🕐",
         "Open-Meteo – Previsão (diária)":   "📅",
         "Estação Meteorológica":            "🌡️",
+        "Dados da Comunidade":              "🙋",
         "INMET - Cachoeira do Sul":         "📡",
         "INMET - Santa Maria Automática":   "📡",
         "INMET - Santa Maria Convencional": "📡",
@@ -728,6 +800,12 @@ def inicio():
             <a href="{GSHEETS_LINK}" target="_blank"><strong>Abrir planilha →</strong></a>
         </div>"""
 
+    banner_comunidade = """
+    <div class="banner-add">
+        🙋 Tem uma estação ou termômetro em casa? &nbsp;
+        <a href="/adicionar"><strong>Adicione seus dados meteorológicos →</strong></a>
+    </div>"""
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -745,6 +823,13 @@ def inicio():
         }}
         .banner-gs a {{ color: #1B5E20; }}
 
+        .banner-add {{
+            background: #EDE7F6; border: 1px solid #B39DDB;
+            border-radius: 8px; padding: 10px 16px; margin-bottom: 14px;
+            font-size: 13px; color: #4527A0;
+        }}
+        .banner-add a {{ color: #4527A0; }}
+
         .filtros {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }}
         .btn {{
             padding: 7px 16px; border-radius: 20px; font-size: 13px;
@@ -761,6 +846,7 @@ def inicio():
         .src-cachoeira      {{ background: #C8E6C9; color: #1B5E20; }}
         .src-sm-auto        {{ background: #FFF9C4; color: #E65100; }}
         .src-sm-conv        {{ background: #F8BBD0; color: #880E4F; }}
+        .src-comunidade     {{ background: #D1C4E9; color: #4527A0; }}
 
         .wrapper {{ overflow-x: auto; }}
         table    {{ border-collapse: collapse; width: 100%; font-size: 12px; background: white; min-width: 900px; }}
@@ -776,6 +862,7 @@ def inicio():
         tr.src-cachoeira     td {{ background: #E8F5E9; }}
         tr.src-sm-auto       td {{ background: #FFFDE7; }}
         tr.src-sm-conv       td {{ background: #FCE4EC; }}
+        tr.src-comunidade    td {{ background: #EDE7F6; }}
     </style>
 </head>
 <body>
@@ -786,6 +873,7 @@ def inicio():
        Última atualização: <strong>{rodape_atualizacao}</strong></p>
 
     {banner_sheets}
+    {banner_comunidade}
 
     <div class="filtros">
         {botoes}
@@ -829,6 +917,134 @@ def _data_mais_recente_por_fonte(df):
         except Exception as e:
             resultado[fonte] = f"erro ao calcular: {e}"
     return resultado
+
+@app.route("/adicionar", methods=["GET", "POST"])
+def adicionar_dado():
+    """
+    Formulário público: qualquer pessoa com acesso ao site pode enviar
+    seus próprios dados meteorológicos (ex.: leitura de um termômetro,
+    estação caseira, pluviômetro). O envio é gravado direto na aba
+    "Dados da Comunidade" e entra na tabela unificada (coletar_dados_comunidade),
+    junto com as demais fontes.
+
+    ATENÇÃO: não há login nem validação de veracidade — qualquer um pode
+    enviar qualquer valor. Os dados aparecem claramente identificados como
+    "Dados da Comunidade" (não misturados com INMET/Open-Meteo) para deixar
+    claro que são autodeclarados.
+    """
+    erro    = None
+    sucesso = False
+
+    if flask_request.method == "POST":
+        nome     = flask_request.form.get("nome", "").strip()
+        cidade   = flask_request.form.get("cidade", "").strip()
+        temp     = flask_request.form.get("temperatura", "").strip()
+        umidade  = flask_request.form.get("umidade", "").strip()
+        vento    = flask_request.form.get("vento", "").strip()
+        precip   = flask_request.form.get("precip", "").strip()
+        radiacao = flask_request.form.get("radiacao", "").strip()
+        obs      = flask_request.form.get("observacao", "").strip()
+
+        if not cidade or not temp:
+            erro = "Preencha ao menos a cidade/bairro e a temperatura."
+        else:
+            agora = datetime.now()
+            linha = {
+                "Nome/Apelido":          nome or "Anônimo",
+                "Cidade/Bairro":         cidade,
+                "Data":                  agora.strftime("%Y-%m-%d"),
+                "Hora":                  agora.strftime("%H:%M"),
+                "Temperatura (°C)":      temp,
+                "Umidade (%RH)":         umidade,
+                "Vento (km/h)":          vento,
+                "Precip. (mm)":          precip,
+                "Radiação Solar (W/m²)": radiacao,
+                "Observação":            obs,
+            }
+            try:
+                _salvar_dado_comunidade(linha)
+                sucesso = True
+                # atualiza a tabela em segundo plano pra já refletir o novo
+                # dado sem precisar esperar o próximo ciclo agendado
+                threading.Thread(target=atualizar_dados, daemon=True).start()
+            except Exception as e:
+                log.error(f"Erro ao salvar dado da comunidade: {e}")
+                erro = "Não foi possível salvar seus dados agora. Tente novamente em instantes."
+
+    mensagem_html = ""
+    if sucesso:
+        mensagem_html = '<div class="msg msg-ok">✅ Dados enviados! Já entraram na tabela (pode levar alguns segundos para aparecer).</div>'
+    elif erro:
+        mensagem_html = f'<div class="msg msg-erro">⚠️ {erro}</div>'
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Adicionar dados — Clima Unificado</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f0f2f5; }}
+        h1   {{ color: #4527A0; margin-bottom: 4px; }}
+        p.info {{ color: #555; font-size: 13px; margin-bottom: 20px; }}
+        a.voltar {{ font-size: 13px; color: #1565C0; text-decoration: none; }}
+        form {{
+            background: white; border-radius: 10px; padding: 20px 24px;
+            max-width: 460px; box-shadow: 0 1px 4px rgba(0,0,0,.1);
+        }}
+        label {{ display: block; font-size: 13px; font-weight: bold; color: #333; margin: 12px 0 4px; }}
+        input, textarea {{
+            width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px;
+            font-size: 14px; box-sizing: border-box;
+        }}
+        .campo-obrigatorio {{ color: #C62828; font-weight: normal; }}
+        button {{
+            margin-top: 18px; background: #4527A0; color: white; border: none;
+            padding: 10px 22px; border-radius: 20px; font-size: 14px; font-weight: bold;
+            cursor: pointer;
+        }}
+        button:hover {{ opacity: .85; }}
+        .msg {{ padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; max-width: 460px; }}
+        .msg-ok    {{ background: #E8F5E9; border: 1px solid #A5D6A7; color: #1B5E20; }}
+        .msg-erro  {{ background: #FFEBEE; border: 1px solid #EF9A9A; color: #B71C1C; }}
+    </style>
+</head>
+<body>
+    <a class="voltar" href="/">← Voltar para a tabela</a>
+    <h1>🙋 Adicionar dados meteorológicos</h1>
+    <p class="info">Preencha o que você tiver disponível — só cidade/bairro e temperatura são obrigatórios.
+       Seus dados entram na tabela identificados como "Dados da Comunidade".</p>
+
+    {mensagem_html}
+
+    <form method="POST" action="/adicionar">
+        <label>Nome ou apelido</label>
+        <input type="text" name="nome" placeholder="Opcional">
+
+        <label>Cidade/Bairro <span class="campo-obrigatorio">*</span></label>
+        <input type="text" name="cidade" required>
+
+        <label>Temperatura (°C) <span class="campo-obrigatorio">*</span></label>
+        <input type="number" step="0.1" name="temperatura" required>
+
+        <label>Umidade (%RH)</label>
+        <input type="number" step="0.1" name="umidade">
+
+        <label>Vento (km/h)</label>
+        <input type="number" step="0.1" name="vento">
+
+        <label>Precipitação (mm)</label>
+        <input type="number" step="0.1" name="precip">
+
+        <label>Radiação Solar (W/m²)</label>
+        <input type="number" step="0.1" name="radiacao">
+
+        <label>Observação</label>
+        <textarea name="observacao" rows="3" placeholder="Opcional"></textarea>
+
+        <button type="submit">Enviar dados</button>
+    </form>
+</body>
+</html>"""
 
 @app.route("/status")
 def status():
