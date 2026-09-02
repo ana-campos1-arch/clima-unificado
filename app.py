@@ -351,6 +351,11 @@ def _salvar_dados_comunidade(linhas):
     Grava várias linhas de uma vez (append_rows) na aba "Dados da
     Comunidade", criando a aba com o cabeçalho se ainda não existir.
     Chamada pela rota /adicionar depois que o CSV enviado é processado.
+
+    Como agora qualquer CSV é aceito (não só o formato fixo de
+    CAMPOS_COMUNIDADE), o cabeçalho da aba é ajustado dinamicamente:
+    colunas novas trazidas por um envio são acrescentadas ao final do
+    cabeçalho já existente, sem apagar nem reordenar o que já estava lá.
     """
     if not linhas:
         return
@@ -361,12 +366,32 @@ def _salvar_dados_comunidade(linhas):
 
     gc = _obter_cliente_gspread()
     sh = gc.open(GSHEETS_NOME)
+
+    # Colunas trazidas por este envio específico, na ordem em que
+    # aparecem nas linhas (já vem com as conhecidas primeiro, veja
+    # _processar_csv_comunidade).
+    colunas_envio = []
+    for linha in linhas:
+        for col in linha.keys():
+            if col not in colunas_envio:
+                colunas_envio.append(col)
+
     try:
         ws = sh.worksheet(DADOS_COMUNIDADE_ABA)
+        cabecalho_atual = ws.row_values(1)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=DADOS_COMUNIDADE_ABA, rows=1000, cols=len(CAMPOS_COMUNIDADE))
-        ws.append_row(CAMPOS_COMUNIDADE)
-    valores = [[str(linha.get(campo, "")) for campo in CAMPOS_COMUNIDADE] for linha in linhas]
+        ws = sh.add_worksheet(
+            title=DADOS_COMUNIDADE_ABA, rows=1000, cols=max(len(colunas_envio), 1)
+        )
+        cabecalho_atual = []
+
+    colunas_novas   = [c for c in colunas_envio if c not in cabecalho_atual]
+    cabecalho_final = cabecalho_atual + colunas_novas
+
+    if cabecalho_final != cabecalho_atual:
+        ws.update([cabecalho_final])
+
+    valores = [[str(linha.get(campo, "")) for campo in cabecalho_final] for linha in linhas]
     ws.append_rows(valores)
 
 # ── Reconhecimento das colunas do CSV enviado pela pessoa ──────────
@@ -414,10 +439,17 @@ def _mapear_colunas_csv(df):
 
 def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
     """
-    Lê o CSV enviado pela pessoa, reconhece as colunas (mesmo com nomes
-    ligeiramente diferentes do modelo) e devolve uma lista de linhas
-    prontas para gravar na aba "Dados da Comunidade", além do total de
-    linhas lidas e de quantas foram ignoradas por faltar cidade/temperatura.
+    Lê o CSV enviado pela pessoa e devolve uma lista de linhas prontas
+    para gravar na aba "Dados da Comunidade", além do total de linhas
+    lidas e de quantas foram ignoradas (só as completamente vazias).
+
+    ACEITA QUALQUER CSV, com qualquer conjunto de colunas — não exige
+    mais nenhuma coluna específica (antes "Cidade/Bairro" e
+    "Temperatura (°C)" eram obrigatórias). Colunas com nomes reconhecidos
+    (ver ALIASES_COMUNIDADE) continuam sendo renomeadas para o padrão
+    usado no resto do app (ex.: "temp" → "Temperatura (°C)"); qualquer
+    outra coluna do arquivo é mantida do jeito que veio e passa a
+    aparecer normalmente na tabela unificada, como uma coluna a mais.
 
     Aceita separador por vírgula ou ponto e vírgula (detecção automática)
     e tenta UTF-8 antes de cair para Latin-1 (comum em CSV exportado do
@@ -435,30 +467,44 @@ def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
 
     df = pd.read_csv(io.StringIO(texto), sep=None, engine="python")
     df = _mapear_colunas_csv(df)
-    df = df.fillna("")
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.fillna("").astype(str)
+    for col in df.columns:
+        df[col] = df[col].str.strip()
 
     agora = datetime.now()
     total = len(df)
+
+    # Nome/Apelido, Data e Hora sempre recebem um valor padrão quando
+    # ausentes ou em branco, pra toda linha ficar identificável e
+    # ordenável na tabela unificada — mas nenhuma outra coluna é exigida.
+    if "Nome/Apelido" not in df.columns:
+        df["Nome/Apelido"] = ""
+    df.loc[df["Nome/Apelido"] == "", "Nome/Apelido"] = nome_padrao or "Anônimo"
+
+    if "Data" not in df.columns:
+        df["Data"] = ""
+    df.loc[df["Data"] == "", "Data"] = agora.strftime("%Y-%m-%d")
+
+    if "Hora" not in df.columns:
+        df["Hora"] = ""
+    df.loc[df["Hora"] == "", "Hora"] = agora.strftime("%H:%M")
+
+    # Reordena só pra ficar mais legível: colunas conhecidas primeiro,
+    # colunas extras do CSV original depois, na ordem em que vieram.
+    ordem_conhecida = [c for c in CAMPOS_COMUNIDADE if c in df.columns]
+    extras          = [c for c in df.columns if c not in CAMPOS_COMUNIDADE]
+    df = df[ordem_conhecida + extras]
+
     linhas_validas = []
-
     for _, row in df.iterrows():
-        cidade = str(row.get("Cidade/Bairro", "")).strip()
-        temp   = str(row.get("Temperatura (°C)", "")).strip()
-        if not cidade or not temp:
+        linha = row.to_dict()
+        # Uma linha só é ignorada se estiver 100% vazia fora de
+        # Nome/Apelido, Data e Hora (que já vêm preenchidos por padrão
+        # acima e não indicam, sozinhos, que a linha tem dado real).
+        outros_valores = [v for k, v in linha.items() if k not in ("Nome/Apelido", "Data", "Hora")]
+        if outros_valores and not any(v.strip() for v in outros_valores):
             continue
-
-        linha = {
-            "Nome/Apelido":          str(row.get("Nome/Apelido", "")).strip() or nome_padrao or "Anônimo",
-            "Cidade/Bairro":         cidade,
-            "Data":                  str(row.get("Data", "")).strip() or agora.strftime("%Y-%m-%d"),
-            "Hora":                  str(row.get("Hora", "")).strip() or agora.strftime("%H:%M"),
-            "Temperatura (°C)":      temp,
-            "Umidade (%RH)":         str(row.get("Umidade (%RH)", "")).strip(),
-            "Vento (km/h)":          str(row.get("Vento (km/h)", "")).strip(),
-            "Precip. (mm)":          str(row.get("Precip. (mm)", "")).strip(),
-            "Radiação Solar (W/m²)": str(row.get("Radiação Solar (W/m²)", "")).strip(),
-            "Observação":            str(row.get("Observação", "")).strip(),
-        }
         linhas_validas.append(linha)
 
     ignoradas = total - len(linhas_validas)
@@ -1021,7 +1067,9 @@ def adicionar_dado():
     """
     Formulário público: qualquer pessoa com acesso ao site pode enviar
     seus próprios dados meteorológicos enviando um arquivo CSV (ex.:
-    exportado de uma planilha, estação caseira, pluviômetro). As linhas
+    exportado de uma planilha, estação caseira, pluviômetro). QUALQUER
+    CSV é aceito, com qualquer conjunto de colunas — não há mais um
+    formato fixo obrigatório (ver _processar_csv_comunidade). As linhas
     válidas são gravadas na aba "Dados da Comunidade" e entram na tabela
     unificada (coletar_dados_comunidade), junto com as demais fontes.
 
@@ -1047,9 +1095,8 @@ def adicionar_dado():
                 conteudo = arquivo.read()
                 linhas, total, ignoradas = _processar_csv_comunidade(conteudo, nome)
                 if not linhas:
-                    erro = ("Nenhuma linha válida encontrada no CSV. Confira se as colunas "
-                            "'Cidade/Bairro' e 'Temperatura (°C)' estão preenchidas — "
-                            "baixe o modelo abaixo se tiver dúvida no formato.")
+                    erro = ("Nenhuma linha com dados foi encontrada nesse CSV — parece estar "
+                            "vazio ou só com linhas em branco.")
                 else:
                     _salvar_dados_comunidade(linhas)
                     sucesso_qtd = len(linhas)
@@ -1062,7 +1109,7 @@ def adicionar_dado():
 
     mensagem_html = ""
     if sucesso_qtd is not None:
-        extra = f" ({ignoradas} linha(s) ignorada(s) por faltar cidade/temperatura)" if ignoradas else ""
+        extra = f" ({ignoradas} linha(s) ignorada(s) por estarem vazias)" if ignoradas else ""
         mensagem_html = (
             f'<div class="msg msg-ok">✅ {sucesso_qtd} registro(s) enviado(s){extra}! '
             f'Pode levar alguns segundos para aparecer na tabela.</div>'
@@ -1112,7 +1159,9 @@ def adicionar_dado():
     <a class="voltar" href="/">← Voltar para a tabela</a>
     <h1>🙋 Adicionar dados meteorológicos</h1>
     <p class="info">Envie um arquivo CSV com seus dados (de uma planilha, estação caseira, etc.).
-       Cada linha do arquivo vira um registro na tabela, identificado como "Dados da Comunidade".</p>
+       Qualquer CSV é aceito — pode ter as colunas que você já tiver, com o nome que já tiver;
+       não é preciso adaptar o arquivo a um formato específico. Cada linha do arquivo vira um
+       registro na tabela, identificado como "Dados da Comunidade".</p>
 
     {mensagem_html}
 
@@ -1127,12 +1176,13 @@ def adicionar_dado():
     </form>
 
     <div class="modelo">
-        Colunas reconhecidas (só <strong>Cidade/Bairro</strong> e <strong>Temperatura (°C)</strong> são
-        obrigatórias; o resto pode faltar ou vir em branco):
+        Nenhuma coluna é obrigatória — pode enviar seu CSV do jeito que ele já está.
+        Se o arquivo tiver colunas parecidas com estas (sem precisar ser o nome exato — sem
+        acento, "temp", "chuva" etc. também são reconhecidos), elas são identificadas
+        automaticamente:
         <ul>{colunas_modelo}</ul>
-        Não precisa ser esse nome exato — variações comuns (sem acento, "temp", "chuva" etc.) também são
-        reconhecidas.
-        <br><a href="/modelo-comunidade.csv">📥 Baixar modelo de CSV</a>
+        Qualquer outra coluna do arquivo é mantida do jeito que veio e também entra na tabela.
+        <br><a href="/modelo-comunidade.csv">📥 Baixar modelo de CSV (opcional, só como referência)</a>
     </div>
 </body>
 </html>"""
