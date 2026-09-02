@@ -51,7 +51,7 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
-from flask import Flask, request as flask_request
+from flask import Flask, Response, request as flask_request
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -346,12 +346,14 @@ def coletar_dados_comunidade():
         _marcar_diagnostico("Dados da Comunidade", False, 0, str(e))
         return pd.DataFrame()
 
-def _salvar_dado_comunidade(linha: dict):
+def _salvar_dados_comunidade(linhas):
     """
-    Grava uma linha nova (append) na aba "Dados da Comunidade", criando a
-    aba com o cabeçalho se ainda não existir. Chamada pela rota /adicionar
-    quando alguém envia o formulário público.
+    Grava várias linhas de uma vez (append_rows) na aba "Dados da
+    Comunidade", criando a aba com o cabeçalho se ainda não existir.
+    Chamada pela rota /adicionar depois que o CSV enviado é processado.
     """
+    if not linhas:
+        return
     if not GSHEETS_ATIVO:
         raise RuntimeError("Google Sheets desativado; não é possível salvar envios do formulário.")
 
@@ -364,7 +366,103 @@ def _salvar_dado_comunidade(linha: dict):
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title=DADOS_COMUNIDADE_ABA, rows=1000, cols=len(CAMPOS_COMUNIDADE))
         ws.append_row(CAMPOS_COMUNIDADE)
-    ws.append_row([str(linha.get(campo, "")) for campo in CAMPOS_COMUNIDADE])
+    valores = [[str(linha.get(campo, "")) for campo in CAMPOS_COMUNIDADE] for linha in linhas]
+    ws.append_rows(valores)
+
+# ── Reconhecimento das colunas do CSV enviado pela pessoa ──────────
+# As pessoas podem exportar a planilha delas com nomes de coluna
+# ligeiramente diferentes (com/sem acento, maiúsculas, "temp" em vez de
+# "temperatura", etc). Este dicionário normaliza tudo pro nome oficial
+# usado na aba "Dados da Comunidade".
+
+ALIASES_COMUNIDADE = {
+    "nome": "Nome/Apelido", "apelido": "Nome/Apelido", "nome/apelido": "Nome/Apelido",
+    "nome apelido": "Nome/Apelido",
+    "cidade": "Cidade/Bairro", "bairro": "Cidade/Bairro", "cidade/bairro": "Cidade/Bairro",
+    "cidade bairro": "Cidade/Bairro", "local": "Cidade/Bairro", "localidade": "Cidade/Bairro",
+    "data": "Data",
+    "hora": "Hora",
+    "temperatura": "Temperatura (°C)", "temp": "Temperatura (°C)",
+    "temperatura (°c)": "Temperatura (°C)", "temperatura c": "Temperatura (°C)",
+    "temperatura (c)": "Temperatura (°C)",
+    "umidade": "Umidade (%RH)", "umidade (%rh)": "Umidade (%RH)", "umidade %": "Umidade (%RH)",
+    "vento": "Vento (km/h)", "vento (km/h)": "Vento (km/h)", "vento km/h": "Vento (km/h)",
+    "precipitacao": "Precip. (mm)", "precip": "Precip. (mm)", "precip. (mm)": "Precip. (mm)",
+    "chuva": "Precip. (mm)", "chuva (mm)": "Precip. (mm)",
+    "radiacao": "Radiação Solar (W/m²)", "radiacao solar": "Radiação Solar (W/m²)",
+    "radiacao solar (w/m2)": "Radiação Solar (W/m²)", "radiacao (w/m2)": "Radiação Solar (W/m²)",
+    "observacao": "Observação", "observacoes": "Observação", "obs": "Observação",
+    "comentario": "Observação", "comentarios": "Observação",
+}
+
+def _normalizar_texto(txt):
+    """Minúsculas, sem acento e sem espaços nas pontas — usado para casar
+    nomes de coluna do CSV com ALIASES_COMUNIDADE, mesmo com pequenas
+    diferenças de grafia."""
+    import unicodedata
+    txt = str(txt).strip().lower()
+    txt = "".join(c for c in unicodedata.normalize("NFKD", txt) if not unicodedata.combining(c))
+    return txt
+
+def _mapear_colunas_csv(df):
+    renomear = {}
+    for col in df.columns:
+        chave = _normalizar_texto(col)
+        if chave in ALIASES_COMUNIDADE:
+            renomear[col] = ALIASES_COMUNIDADE[chave]
+    return df.rename(columns=renomear)
+
+def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
+    """
+    Lê o CSV enviado pela pessoa, reconhece as colunas (mesmo com nomes
+    ligeiramente diferentes do modelo) e devolve uma lista de linhas
+    prontas para gravar na aba "Dados da Comunidade", além do total de
+    linhas lidas e de quantas foram ignoradas por faltar cidade/temperatura.
+
+    Aceita separador por vírgula ou ponto e vírgula (detecção automática)
+    e tenta UTF-8 antes de cair para Latin-1 (comum em CSV exportado do
+    Excel no Brasil).
+    """
+    texto = None
+    for encoding in ("utf-8-sig", "latin1"):
+        try:
+            texto = conteudo_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if texto is None:
+        raise ValueError("Não foi possível ler a codificação do arquivo.")
+
+    df = pd.read_csv(io.StringIO(texto), sep=None, engine="python")
+    df = _mapear_colunas_csv(df)
+    df = df.fillna("")
+
+    agora = datetime.now()
+    total = len(df)
+    linhas_validas = []
+
+    for _, row in df.iterrows():
+        cidade = str(row.get("Cidade/Bairro", "")).strip()
+        temp   = str(row.get("Temperatura (°C)", "")).strip()
+        if not cidade or not temp:
+            continue
+
+        linha = {
+            "Nome/Apelido":          str(row.get("Nome/Apelido", "")).strip() or nome_padrao or "Anônimo",
+            "Cidade/Bairro":         cidade,
+            "Data":                  str(row.get("Data", "")).strip() or agora.strftime("%Y-%m-%d"),
+            "Hora":                  str(row.get("Hora", "")).strip() or agora.strftime("%H:%M"),
+            "Temperatura (°C)":      temp,
+            "Umidade (%RH)":         str(row.get("Umidade (%RH)", "")).strip(),
+            "Vento (km/h)":          str(row.get("Vento (km/h)", "")).strip(),
+            "Precip. (mm)":          str(row.get("Precip. (mm)", "")).strip(),
+            "Radiação Solar (W/m²)": str(row.get("Radiação Solar (W/m²)", "")).strip(),
+            "Observação":            str(row.get("Observação", "")).strip(),
+        }
+        linhas_validas.append(linha)
+
+    ignoradas = total - len(linhas_validas)
+    return linhas_validas, total, ignoradas
 
 # ==========================================================
 # INMET — API de tempo real (fonte principal) + ZIP anual (reserva)
@@ -802,8 +900,8 @@ def inicio():
 
     banner_comunidade = """
     <div class="banner-add">
-        🙋 Tem uma estação ou termômetro em casa? &nbsp;
-        <a href="/adicionar"><strong>Adicione seus dados meteorológicos →</strong></a>
+        🙋 Tem dados meteorológicos próprios? &nbsp;
+        <a href="/adicionar"><strong>Envie um CSV com seus dados →</strong></a>
     </div>"""
 
     return f"""<!DOCTYPE html>
@@ -922,60 +1020,57 @@ def _data_mais_recente_por_fonte(df):
 def adicionar_dado():
     """
     Formulário público: qualquer pessoa com acesso ao site pode enviar
-    seus próprios dados meteorológicos (ex.: leitura de um termômetro,
-    estação caseira, pluviômetro). O envio é gravado direto na aba
-    "Dados da Comunidade" e entra na tabela unificada (coletar_dados_comunidade),
-    junto com as demais fontes.
+    seus próprios dados meteorológicos enviando um arquivo CSV (ex.:
+    exportado de uma planilha, estação caseira, pluviômetro). As linhas
+    válidas são gravadas na aba "Dados da Comunidade" e entram na tabela
+    unificada (coletar_dados_comunidade), junto com as demais fontes.
 
     ATENÇÃO: não há login nem validação de veracidade — qualquer um pode
     enviar qualquer valor. Os dados aparecem claramente identificados como
     "Dados da Comunidade" (não misturados com INMET/Open-Meteo) para deixar
     claro que são autodeclarados.
     """
-    erro    = None
-    sucesso = False
+    erro        = None
+    sucesso_qtd = None
+    ignoradas   = 0
 
     if flask_request.method == "POST":
-        nome     = flask_request.form.get("nome", "").strip()
-        cidade   = flask_request.form.get("cidade", "").strip()
-        temp     = flask_request.form.get("temperatura", "").strip()
-        umidade  = flask_request.form.get("umidade", "").strip()
-        vento    = flask_request.form.get("vento", "").strip()
-        precip   = flask_request.form.get("precip", "").strip()
-        radiacao = flask_request.form.get("radiacao", "").strip()
-        obs      = flask_request.form.get("observacao", "").strip()
+        nome    = flask_request.form.get("nome", "").strip()
+        arquivo = flask_request.files.get("arquivo")
 
-        if not cidade or not temp:
-            erro = "Preencha ao menos a cidade/bairro e a temperatura."
+        if not arquivo or arquivo.filename == "":
+            erro = "Selecione um arquivo .csv para enviar."
+        elif not arquivo.filename.lower().endswith(".csv"):
+            erro = "O arquivo precisa ser um .csv."
         else:
-            agora = datetime.now()
-            linha = {
-                "Nome/Apelido":          nome or "Anônimo",
-                "Cidade/Bairro":         cidade,
-                "Data":                  agora.strftime("%Y-%m-%d"),
-                "Hora":                  agora.strftime("%H:%M"),
-                "Temperatura (°C)":      temp,
-                "Umidade (%RH)":         umidade,
-                "Vento (km/h)":          vento,
-                "Precip. (mm)":          precip,
-                "Radiação Solar (W/m²)": radiacao,
-                "Observação":            obs,
-            }
             try:
-                _salvar_dado_comunidade(linha)
-                sucesso = True
-                # atualiza a tabela em segundo plano pra já refletir o novo
-                # dado sem precisar esperar o próximo ciclo agendado
-                threading.Thread(target=atualizar_dados, daemon=True).start()
+                conteudo = arquivo.read()
+                linhas, total, ignoradas = _processar_csv_comunidade(conteudo, nome)
+                if not linhas:
+                    erro = ("Nenhuma linha válida encontrada no CSV. Confira se as colunas "
+                            "'Cidade/Bairro' e 'Temperatura (°C)' estão preenchidas — "
+                            "baixe o modelo abaixo se tiver dúvida no formato.")
+                else:
+                    _salvar_dados_comunidade(linhas)
+                    sucesso_qtd = len(linhas)
+                    # atualiza a tabela em segundo plano pra já refletir os
+                    # novos dados sem esperar o próximo ciclo agendado
+                    threading.Thread(target=atualizar_dados, daemon=True).start()
             except Exception as e:
-                log.error(f"Erro ao salvar dado da comunidade: {e}")
-                erro = "Não foi possível salvar seus dados agora. Tente novamente em instantes."
+                log.error(f"Erro ao processar CSV da comunidade: {e}")
+                erro = "Não foi possível ler esse arquivo. Confira o formato (CSV) e tente novamente."
 
     mensagem_html = ""
-    if sucesso:
-        mensagem_html = '<div class="msg msg-ok">✅ Dados enviados! Já entraram na tabela (pode levar alguns segundos para aparecer).</div>'
+    if sucesso_qtd is not None:
+        extra = f" ({ignoradas} linha(s) ignorada(s) por faltar cidade/temperatura)" if ignoradas else ""
+        mensagem_html = (
+            f'<div class="msg msg-ok">✅ {sucesso_qtd} registro(s) enviado(s){extra}! '
+            f'Pode levar alguns segundos para aparecer na tabela.</div>'
+        )
     elif erro:
         mensagem_html = f'<div class="msg msg-erro">⚠️ {erro}</div>'
+
+    colunas_modelo = "".join(f"<li>{c}</li>" for c in CAMPOS_COMUNIDADE)
 
     return f"""<!DOCTYPE html>
 <html>
@@ -992,11 +1087,10 @@ def adicionar_dado():
             max-width: 460px; box-shadow: 0 1px 4px rgba(0,0,0,.1);
         }}
         label {{ display: block; font-size: 13px; font-weight: bold; color: #333; margin: 12px 0 4px; }}
-        input, textarea {{
+        input[type="text"], input[type="file"] {{
             width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px;
-            font-size: 14px; box-sizing: border-box;
+            font-size: 14px; box-sizing: border-box; background: white;
         }}
-        .campo-obrigatorio {{ color: #C62828; font-weight: normal; }}
         button {{
             margin-top: 18px; background: #4527A0; color: white; border: none;
             padding: 10px 22px; border-radius: 20px; font-size: 14px; font-weight: bold;
@@ -1006,45 +1100,58 @@ def adicionar_dado():
         .msg {{ padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; max-width: 460px; }}
         .msg-ok    {{ background: #E8F5E9; border: 1px solid #A5D6A7; color: #1B5E20; }}
         .msg-erro  {{ background: #FFEBEE; border: 1px solid #EF9A9A; color: #B71C1C; }}
+        .modelo {{
+            background: #F3E5F5; border: 1px solid #CE93D8; border-radius: 8px;
+            padding: 12px 16px; max-width: 460px; font-size: 12px; color: #4A148C; margin-top: 18px;
+        }}
+        .modelo ul {{ margin: 6px 0 8px 18px; padding: 0; }}
+        .modelo a {{ color: #4527A0; font-weight: bold; }}
     </style>
 </head>
 <body>
     <a class="voltar" href="/">← Voltar para a tabela</a>
     <h1>🙋 Adicionar dados meteorológicos</h1>
-    <p class="info">Preencha o que você tiver disponível — só cidade/bairro e temperatura são obrigatórios.
-       Seus dados entram na tabela identificados como "Dados da Comunidade".</p>
+    <p class="info">Envie um arquivo CSV com seus dados (de uma planilha, estação caseira, etc.).
+       Cada linha do arquivo vira um registro na tabela, identificado como "Dados da Comunidade".</p>
 
     {mensagem_html}
 
-    <form method="POST" action="/adicionar">
-        <label>Nome ou apelido</label>
+    <form method="POST" action="/adicionar" enctype="multipart/form-data">
+        <label>Nome ou apelido (usado se o CSV não tiver essa coluna)</label>
         <input type="text" name="nome" placeholder="Opcional">
 
-        <label>Cidade/Bairro <span class="campo-obrigatorio">*</span></label>
-        <input type="text" name="cidade" required>
+        <label>Arquivo CSV</label>
+        <input type="file" name="arquivo" accept=".csv" required>
 
-        <label>Temperatura (°C) <span class="campo-obrigatorio">*</span></label>
-        <input type="number" step="0.1" name="temperatura" required>
-
-        <label>Umidade (%RH)</label>
-        <input type="number" step="0.1" name="umidade">
-
-        <label>Vento (km/h)</label>
-        <input type="number" step="0.1" name="vento">
-
-        <label>Precipitação (mm)</label>
-        <input type="number" step="0.1" name="precip">
-
-        <label>Radiação Solar (W/m²)</label>
-        <input type="number" step="0.1" name="radiacao">
-
-        <label>Observação</label>
-        <textarea name="observacao" rows="3" placeholder="Opcional"></textarea>
-
-        <button type="submit">Enviar dados</button>
+        <button type="submit">Enviar CSV</button>
     </form>
+
+    <div class="modelo">
+        Colunas reconhecidas (só <strong>Cidade/Bairro</strong> e <strong>Temperatura (°C)</strong> são
+        obrigatórias; o resto pode faltar ou vir em branco):
+        <ul>{colunas_modelo}</ul>
+        Não precisa ser esse nome exato — variações comuns (sem acento, "temp", "chuva" etc.) também são
+        reconhecidas.
+        <br><a href="/modelo-comunidade.csv">📥 Baixar modelo de CSV</a>
+    </div>
 </body>
 </html>"""
+
+@app.route("/modelo-comunidade.csv")
+def modelo_comunidade_csv():
+    """CSV de exemplo com o cabeçalho esperado, pra facilitar quem for
+    montar o arquivo pra enviar em /adicionar."""
+    linhas_exemplo = [
+        CAMPOS_COMUNIDADE,
+        ["Maria", "Cachoeira do Sul - Centro", "2026-09-02", "14:00",
+         "27.5", "60", "8", "0", "650", "Céu limpo"],
+    ]
+    texto_csv = "\n".join(";".join(str(v) for v in linha) for linha in linhas_exemplo)
+    return Response(
+        texto_csv,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=modelo-dados-comunidade.csv"},
+    )
 
 @app.route("/status")
 def status():
