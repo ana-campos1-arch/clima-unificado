@@ -18,6 +18,12 @@
 #
 # O QUE MUDOU NESTA VERSÃO
 # ─────────────────────────────────────────────────────────
+#  • NOVO: aba "Gráficos" na planilha de destino, com dois gráficos
+#    de linha nativos do Google Sheets montados a partir dos dados do
+#    Open-Meteo: a variação da temperatura hora a hora de hoje e as
+#    máximas/mínimas dos próximos 7 dias. Os gráficos são criados uma
+#    única vez; nos ciclos seguintes só os números são reescritos e os
+#    gráficos se atualizam sozinhos.
 #  • MUDANÇA PRINCIPAL: o INMET agora é coletado pela API de TEMPO REAL
 #    (apitempo.inmet.gov.br), que devolve dado hora a hora direto da
 #    estação — assim como o Open-Meteo. O ZIP histórico anual (que passa
@@ -35,7 +41,7 @@
 #    mudaram (evita bater no limite de requisições da API).
 #  • /status mostra a data/hora mais recente de cada fonte de dados,
 #    reconhecendo tanto os nomes de coluna do ZIP quanto da API.
-#  • NOVO: coleta de radiação solar (Open-Meteo hora a hora e previsão
+#  • Coleta de radiação solar (Open-Meteo hora a hora e previsão
 #    diária). Para o INMET e a Estação Meteorológica, a radiação já
 #    entra automaticamente se a fonte fornecer essa coluna — nada
 #    precisou mudar nesses dois caminhos.
@@ -806,6 +812,181 @@ def _escrever_aba_com_retry(sh, nome_aba, dados, tentativas=3, pular_dedup=False
             return
     log.error(f"Falha ao escrever aba '{nome_aba}' após {tentativas} tentativas.")
 
+# ==========================================================
+# ABA "GRÁFICOS" — temperatura do dia e da semana (Open-Meteo)
+# ==========================================================
+#
+# Cria/atualiza uma aba "Gráficos" com dois blocos de dados NUMÉRICOS
+# vindos do Open-Meteo:
+#     A:B  -> temperatura hora a hora de hoje
+#     D:F  -> máxima e mínima dos próximos 7 dias
+# Na primeira execução, insere dois gráficos de linha nativos do Google
+# Sheets apontando para esses blocos. Nos ciclos seguintes só reescreve
+# os números — os gráficos já existentes se atualizam sozinhos.
+#
+# Os dados são gravados aqui por uma função própria (e não por
+# _escrever_aba_com_retry) porque aquela converte tudo em texto, e o
+# Sheets não plota texto: gráfico precisa de número de verdade.
+#
+# As faixas usadas pelos gráficos vão até a linha 200 de propósito —
+# sobra espaço se um dia forem mais horas/dias, e célula vazia
+# simplesmente não é plotada.
+
+ABA_GRAFICOS = "Gráficos"
+_GRAF_LINHAS_MAX = 200
+
+def _dados_graficos(df):
+    """Extrai da tabela unificada os dois blocos numéricos do Open-Meteo."""
+    linhas_hora, linhas_dia = [], []
+    if df.empty or "Estacao" not in df.columns:
+        return linhas_hora, linhas_dia
+
+    # ── Temperatura hora a hora (hoje) ──
+    df_h = df[df["Estacao"] == "Open-Meteo – Hoje (horário)"].copy()
+    if not df_h.empty and "Temperatura (°C)" in df_h.columns:
+        df_h["_temp"] = pd.to_numeric(df_h["Temperatura (°C)"], errors="coerce")
+        df_h = df_h.dropna(subset=["_temp"]).sort_values("Hora")
+        linhas_hora = [
+            [str(r["Hora"])[:5], float(r["_temp"])] for _, r in df_h.iterrows()
+        ]
+
+    # ── Máxima e mínima da semana (próximos 7 dias) ──
+    df_d = df[df["Estacao"] == "Open-Meteo – Previsão (diária)"].copy()
+    if not df_d.empty and "Temp. Máx (°C)" in df_d.columns:
+        df_d["_max"] = pd.to_numeric(df_d["Temp. Máx (°C)"], errors="coerce")
+        df_d["_min"] = pd.to_numeric(df_d["Temp. Mín (°C)"], errors="coerce")
+        df_d = df_d.dropna(subset=["_max", "_min"]).sort_values("Data").head(7)
+        linhas_dia = [
+            [str(r["Data"]), float(r["_max"]), float(r["_min"])]
+            for _, r in df_d.iterrows()
+        ]
+
+    return linhas_hora, linhas_dia
+
+def _faixa_grafico(sheet_id, col_ini, col_fim):
+    return {
+        "sheetId": sheet_id,
+        "startRowIndex": 0,
+        "endRowIndex": _GRAF_LINHAS_MAX,
+        "startColumnIndex": col_ini,
+        "endColumnIndex": col_fim,
+    }
+
+def _spec_grafico_linha(sheet_id, titulo, titulo_x, col_dominio, colunas_series,
+                        linha_ancora, coluna_ancora):
+    """Monta a requisição addChart de um gráfico de linha."""
+    return {
+        "addChart": {
+            "chart": {
+                "spec": {
+                    "title": titulo,
+                    "basicChart": {
+                        "chartType": "LINE",
+                        "legendPosition": "BOTTOM_LEGEND",
+                        "headerCount": 1,
+                        "axis": [
+                            {"position": "BOTTOM_AXIS", "title": titulo_x},
+                            {"position": "LEFT_AXIS", "title": "Temperatura (°C)"},
+                        ],
+                        "domains": [{
+                            "domain": {"sourceRange": {"sources": [
+                                _faixa_grafico(sheet_id, col_dominio, col_dominio + 1)
+                            ]}}
+                        }],
+                        "series": [
+                            {
+                                "series": {"sourceRange": {"sources": [
+                                    _faixa_grafico(sheet_id, c, c + 1)
+                                ]}},
+                                "targetAxis": "LEFT_AXIS",
+                            }
+                            for c in colunas_series
+                        ],
+                    },
+                },
+                "position": {"overlayPosition": {
+                    "anchorCell": {
+                        "sheetId": sheet_id,
+                        "rowIndex": linha_ancora,
+                        "columnIndex": coluna_ancora,
+                    },
+                    "widthPixels": 620,
+                    "heightPixels": 340,
+                }},
+            }
+        }
+    }
+
+def _atualizar_aba_graficos(sh, df):
+    """
+    Reescreve os dados da aba "Gráficos" e, se ainda não houver gráficos
+    nela, cria os dois gráficos de linha. Falhas aqui não derrubam o
+    restante da exportação.
+    """
+    import gspread
+
+    linhas_hora, linhas_dia = _dados_graficos(df)
+    if not linhas_hora and not linhas_dia:
+        log.info("Sem dados do Open-Meteo neste ciclo; aba de gráficos não foi atualizada.")
+        return
+
+    try:
+        try:
+            ws = sh.worksheet(ABA_GRAFICOS)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=ABA_GRAFICOS, rows=_GRAF_LINHAS_MAX, cols=20)
+
+        # Limpa só as colunas de dados (A:F), preservando os gráficos.
+        ws.batch_clear([f"A1:F{_GRAF_LINHAS_MAX}"])
+
+        if linhas_hora:
+            ws.update(
+                values=[["Hora", "Temperatura (°C)"]] + linhas_hora,
+                range_name="A1",
+                value_input_option="USER_ENTERED",
+            )
+        if linhas_dia:
+            ws.update(
+                values=[["Data", "Temp. Máx (°C)", "Temp. Mín (°C)"]] + linhas_dia,
+                range_name="D1",
+                value_input_option="USER_ENTERED",
+            )
+
+        # Os gráficos são criados uma única vez; depois só os números mudam.
+        metadados = sh.fetch_sheet_metadata(
+            params={"fields": "sheets(properties(sheetId,title),charts(chartId))"}
+        )
+        ja_tem_grafico = any(
+            aba.get("properties", {}).get("title") == ABA_GRAFICOS and aba.get("charts")
+            for aba in metadados.get("sheets", [])
+        )
+        if ja_tem_grafico:
+            log.info("Aba 'Gráficos' atualizada (gráficos já existentes).")
+            _marcar_diagnostico("Gráficos (aba)", True, len(linhas_hora) + len(linhas_dia),
+                                "dados reescritos")
+            return
+
+        requisicoes = [
+            _spec_grafico_linha(
+                ws.id, "Variação da temperatura hoje (hora a hora) — Open-Meteo",
+                "Hora", col_dominio=0, colunas_series=[1],
+                linha_ancora=0, coluna_ancora=7,
+            ),
+            _spec_grafico_linha(
+                ws.id, "Máxima e mínima da semana — Open-Meteo",
+                "Data", col_dominio=3, colunas_series=[4, 5],
+                linha_ancora=19, coluna_ancora=7,
+            ),
+        ]
+        sh.batch_update({"requests": requisicoes})
+        log.info("Gráficos de temperatura criados na aba 'Gráficos'.")
+        _marcar_diagnostico("Gráficos (aba)", True, len(linhas_hora) + len(linhas_dia),
+                            "gráficos criados")
+
+    except Exception as e:
+        log.error(f"Erro ao montar a aba de gráficos: {e}")
+        _marcar_diagnostico("Gráficos (aba)", False, 0, str(e))
+
 def exportar_para_sheets(df):
     try:
         import gspread  # noqa: F401 (garante que a lib está instalada)
@@ -831,6 +1012,9 @@ def exportar_para_sheets(df):
             return
 
         _escrever_aba_com_retry(sh, "Todas", df)
+
+        # Aba com os gráficos de temperatura (dia e semana, Open-Meteo).
+        _atualizar_aba_graficos(sh, df)
 
         for fonte in df["Estacao"].unique():
             df_f = df[df["Estacao"] == fonte]
@@ -942,6 +1126,7 @@ def inicio():
         <div class="banner-gs">
             📊 Dados sincronizados com o Google Sheets:&nbsp;
             <a href="{GSHEETS_LINK}" target="_blank"><strong>Abrir planilha →</strong></a>
+            &nbsp;|&nbsp; veja os gráficos de temperatura na aba <strong>Gráficos</strong>.
         </div>"""
 
     banner_comunidade = """
