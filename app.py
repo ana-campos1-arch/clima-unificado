@@ -48,6 +48,7 @@
 # ==========================================================
 
 import io
+import json
 import logging
 import os
 import threading
@@ -686,6 +687,157 @@ def encontrar_coluna(colunas, *chaves):
     return None
 
 # ==========================================================
+# ANÁLISE HISTÓRICA — série temporal, médias e tendência por fonte
+# ==========================================================
+# Usado pela aba "/graficos" (pré-visualização dos dados na plataforma).
+# Cada fonte guarda data/hora e as grandezas (temperatura, umidade,
+# radiação) em colunas com nomes bem diferentes entre si — Open-Meteo,
+# INMET via API tempo real, Estação Meteorológica e Dados da Comunidade
+# — então essas funções tentam reconhecer os padrões mais comuns de cada
+# uma antes de desistir dessa fonte pra aquela grandeza específica.
+
+MÉTRICAS_HISTORICAS = {
+    "temperatura": {
+        "titulo": "Temperatura",
+        "unidade": "°C",
+        "candidatos_col": [
+            ("TEMPERATURA",),   # Open-Meteo: "Temperatura (°C)"; Comunidade: idem
+            ("TEM", "INS"),     # INMET API tempo real: "TEM_INS"
+            ("TEM", "MED"),     # INMET ZIP histórico (variações "TEM_MED...")
+            ("TEMP", "MEDIA"),  # fontes com "temp_media"
+            ("TEMP", "MÉDIA"),
+            ("TEMP", "MAX"),    # fallback: usa a máxima do dia (previsão diária)
+        ],
+    },
+    "umidade": {
+        "titulo": "Umidade Relativa",
+        "unidade": "%",
+        "candidatos_col": [
+            ("UMIDADE",),       # Open-Meteo: "Umidade (%RH)"; Comunidade: idem
+            ("UMD", "INS"),     # INMET API tempo real: "UMD_INS"
+            ("UMD", "MED"),     # INMET ZIP histórico
+            ("UMID", "MEDIA"),  # fontes com "umid_media"
+        ],
+    },
+    "radiacao": {
+        "titulo": "Radiação Solar",
+        "unidade": "W/m²",
+        "candidatos_col": [
+            ("RADIAÇÃO",),      # Open-Meteo / Comunidade: "Radiação Solar (W/m²)"
+            ("RADIACAO",),
+            ("RAD", "GLO"),     # INMET: "RAD_GLO" / "RADIACAO GLOBAL"
+            ("RADGLO", "MEDIA"),
+        ],
+    },
+}
+
+_CANDIDATOS_COL_DATA = [
+    ("DATA", "HORA"),    # fontes com "Data/Hora" combinado num único campo
+    ("DT", "MEDICAO"),   # INMET API: "DT_MEDICAO"
+    ("DATA",),           # Open-Meteo / ZIP / Comunidade: "Data"
+]
+
+def _achar_coluna_metrica(df, chaves_candidatas):
+    for chaves in chaves_candidatas:
+        col = encontrar_coluna(df.columns, *chaves)
+        if col is not None:
+            return col
+    return None
+
+def _achar_coluna_data(df):
+    for chaves in _CANDIDATOS_COL_DATA:
+        col = encontrar_coluna(df.columns, *chaves)
+        if col is not None:
+            return col
+    return None
+
+def extrair_serie_metrica(df_fonte, metrica, limite_pontos=60):
+    """
+    Retorna uma lista de dicts [{"data": str, "valor": float}, ...],
+    ordenada do mais antigo pro mais recente, pra UMA fonte e UMA
+    grandeza (ex: "temperatura"). Combina Data+Hora quando existem
+    separadas (ex: colunas "Data"/"Hora" do Open-Meteo e do ZIP do
+    INMET). Retorna [] se não achar coluna de data ou da grandeza pedida
+    reconhecível nessa fonte.
+    """
+    info = MÉTRICAS_HISTORICAS[metrica]
+
+    # A tabela unificada concatena todas as fontes, então colunas de
+    # OUTRAS fontes aparecem aqui inteiramente vazias (NaN) pra esta
+    # fonte — precisa ignorá-las, senão o reconhecedor de coluna pode
+    # escolher por engano uma coluna vazia de outra fonte em vez da
+    # coluna certa e preenchida desta.
+    colunas_com_dado = [c for c in df_fonte.columns if df_fonte[c].notna().any()]
+    df_fonte = df_fonte[colunas_com_dado]
+
+    col_valor = _achar_coluna_metrica(df_fonte, info["candidatos_col"])
+    col_data  = _achar_coluna_data(df_fonte)
+    if col_valor is None or col_data is None:
+        return []
+
+    df = df_fonte[[col_data, col_valor]].copy()
+    df.columns = ["data", "valor"]
+
+    # Combina com coluna de Hora separada, se existir e a coluna de data
+    # não já incluir a hora (ex: Open-Meteo tem "Data" e "Hora" à parte;
+    # INMET API tem "HR_MEDICAO" — daí o fallback ("HR","MEDICAO")).
+    col_hora = encontrar_coluna(df_fonte.columns, "HORA") or encontrar_coluna(df_fonte.columns, "HR", "MEDICAO")
+    if col_hora is not None and col_hora != col_data and "HORA" not in str(col_data).upper():
+        df["data"] = df["data"].astype(str) + " " + df_fonte[col_hora].astype(str)
+
+    df["data"]  = df["data"].astype(str).str.strip('"')
+    df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
+    df = df.dropna(subset=["valor"])
+    if df.empty:
+        return []
+
+    df = df.sort_values("data").tail(limite_pontos)
+    return df.to_dict("records")
+
+def calcular_estatisticas(serie, unidade=""):
+    """
+    A partir de uma série [{"data":..., "valor":...}, ...], calcula
+    média, mínima, máxima e uma tendência simples (compara a média do
+    primeiro terço da série com a do último terço — não é regressão
+    estatística rigorosa, mas é suficiente pra sinalizar "subindo",
+    "descendo" ou "estável" de forma visual e fácil de entender, e
+    ajuda a relacionar uma virada de tendência com algo que aconteceu
+    de fato naquele período).
+    """
+    if not serie:
+        return None
+
+    valores = [p["valor"] for p in serie]
+    media   = sum(valores) / len(valores)
+    minima  = min(valores)
+    maxima  = max(valores)
+
+    if len(valores) >= 6:
+        terco = max(1, len(valores) // 3)
+        media_inicio = sum(valores[:terco]) / terco
+        media_fim    = sum(valores[-terco:]) / terco
+        diferenca    = media_fim - media_inicio
+        limiar = max(0.5, abs(media) * 0.03)  # ~3% da média, mínimo 0.5
+        if diferenca > limiar:
+            tendencia = f"📈 Subindo (+{diferenca:.1f}{unidade})"
+        elif diferenca < -limiar:
+            tendencia = f"📉 Descendo ({diferenca:.1f}{unidade})"
+        else:
+            tendencia = "➡️ Estável"
+    else:
+        tendencia = "— (poucos pontos)"
+
+    return {
+        "media": round(media, 1),
+        "minima": round(minima, 1),
+        "maxima": round(maxima, 1),
+        "tendencia": tendencia,
+        "n_pontos": len(valores),
+        "primeira_data": serie[0]["data"],
+        "ultima_data": serie[-1]["data"],
+    }
+
+# ==========================================================
 # ESTADO COMPARTILHADO
 # ==========================================================
 
@@ -1072,6 +1224,15 @@ def agendador():
 
 app = Flask(__name__)
 
+def gerar_linhas(df):
+    """Gera as linhas <tr> da tabela HTML, colorindo cada linha pela fonte."""
+    linhas = []
+    for _, row in df.iterrows():
+        css = FONTE_CSS.get(row.get("Estacao", ""), "")
+        celulas = "".join(f"<td>{v}</td>" for v in row.values)
+        linhas.append(f'<tr class="{css}">{celulas}</tr>')
+    return "\n".join(linhas)
+
 @app.route("/")
 def inicio():
     with tabela_lock:
@@ -1199,7 +1360,8 @@ def inicio():
     <p>Total de registros: <strong>{total}</strong> &nbsp;|&nbsp;
        Exibindo: <strong>{exibido}</strong> &nbsp;|&nbsp;
        Fonte: <strong>{fonte_ativa}</strong> &nbsp;|&nbsp;
-       Última atualização: <strong>{rodape_atualizacao}</strong></p>
+       Última atualização: <strong>{rodape_atualizacao}</strong>
+       &nbsp;|&nbsp; <a href="/graficos" style="color:#1565C0; font-weight:bold;">📊 Gráficos e tendências →</a></p>
 
     {banner_sheets}
     {banner_comunidade}
@@ -1388,62 +1550,162 @@ def modelo_comunidade_csv():
         headers={"Content-Disposition": "attachment; filename=modelo-dados-comunidade.csv"},
     )
 
-@app.route("/status")
-def status():
+@app.route("/graficos")
+def graficos():
     """
-    Endpoint para checar se o servidor está vivo (útil para keep-alive) e,
-    mais importante: mostra a data/hora mais recente presente em cada
-    fonte de dados. Use isso pra confirmar rapidamente se o INMET está
-    atrasado na fonte (limitação deles) ou se o app parou de atualizar
-    (bug/deploy), sem precisar abrir o Sheets ou os Logs do Render.
+    Pré-visualização histórica dos dados: um gráfico por grandeza
+    (temperatura, umidade, radiação solar), comparando todas as fontes
+    disponíveis no momento — INMET, Open-Meteo, Estação Meteorológica e
+    Dados da Comunidade — mais uma tabela de média/mínima/máxima/
+    tendência por fonte em cada grandeza.
+
+    Passe o mouse (ou toque) num ponto do gráfico pra ver a data/hora
+    exata — é assim que dá pra relacionar uma subida/descida com um
+    acontecimento real (ex: entrada de frente fria, período de estiagem),
+    comparando a data no gráfico com o que você sabe que aconteceu.
     """
     with tabela_lock:
         df_atual = tabela.copy()
-    return {
-        "ok": True,
-        "ultima_atualizacao_do_app": str(ultima_atualizacao),
-        "dado_mais_recente_por_fonte": _data_mais_recente_por_fonte(df_atual),
-        "total_registros": len(df_atual),
-    }
 
-@app.route("/atualizar")
-def forcar_atualizacao():
-    """
-    Dispara uma atualização manual (útil para testar sem esperar o agendador).
-    O INMET agora usa a API de tempo real a cada ciclo, então normalmente
-    não precisa de nenhum parâmetro especial. Use /atualizar?inmet=1 apenas
-    se quiser forçar o caminho de RESERVA (ZIP anual) a ignorar o cache de
-    hash e reprocessar mesmo sem mudança — útil só se a API de tempo real
-    estiver fora do ar e você quiser testar o fallback.
-    """
-    forcar_inmet = flask_request.args.get("inmet") == "1"
-    threading.Thread(target=atualizar_dados, kwargs={"forcar_inmet": forcar_inmet}, daemon=True).start()
-    mensagem = "Atualização disparada em segundo plano."
-    if forcar_inmet:
-        mensagem += " Cache de reserva (ZIP) forçado a reprocessar, se for usado."
-    return {"ok": True, "mensagem": mensagem}
+    if df_atual.empty:
+        return ("<h1>Ainda sem dados pra mostrar gráficos. "
+                "<a href='/'>Volte pra página principal</a> e aguarde a primeira coleta.</h1>")
 
-def gerar_linhas(df):
-    html = ""
-    for _, row in df.iterrows():
-        estacao = str(row.get("Estacao", ""))
-        css     = FONTE_CSS.get(estacao, "")
-        celulas = "".join(f"<td>{v}</td>" for v in row)
-        html   += f'<tr class="row {css}">{celulas}</tr>\n'
-    return html
+    cores = ["#1565C0", "#F2A65A", "#6FCF97", "#E88888", "#9575CD", "#4FD1E8", "#4527A0"]
+    fontes_disponiveis = list(df_atual["Estacao"].unique())
+
+    blocos_html = []
+    for metrica, info in MÉTRICAS_HISTORICAS.items():
+        datasets_js  = []
+        linhas_stats = []
+
+        series_por_fonte = {}
+        for fonte in fontes_disponiveis:
+            df_fonte = df_atual[df_atual["Estacao"] == fonte]
+            serie = extrair_serie_metrica(df_fonte, metrica)
+            if serie:
+                series_por_fonte[fonte] = serie
+
+        if not series_por_fonte:
+            continue
+
+        rotulos = sorted({p["data"] for s in series_por_fonte.values() for p in s})
+
+        for fonte, serie in series_por_fonte.items():
+            cor = cores[fontes_disponiveis.index(fonte) % len(cores)]
+            valores_por_data = {p["data"]: p["valor"] for p in serie}
+            datasets_js.append({
+                "label": fonte,
+                "data": [valores_por_data.get(r) for r in rotulos],
+                "borderColor": cor,
+                "backgroundColor": cor,
+                "spanGaps": True,
+                "tension": 0.25,
+                "pointRadius": 2,
+                "borderWidth": 2,
+            })
+            est = calcular_estatisticas(serie, info["unidade"])
+            if est:
+                linhas_stats.append(
+                    f"<tr><td style='text-align:left'><span style='color:{cor}'>●</span> {fonte}</td>"
+                    f"<td>{est['media']}</td><td>{est['minima']}</td><td>{est['maxima']}</td>"
+                    f"<td>{est['tendencia']}</td><td>{est['n_pontos']}</td>"
+                    f"<td>{est['primeira_data']} → {est['ultima_data']}</td></tr>"
+                )
+
+        id_canvas = f"grafico_{metrica}"
+        script = (
+            "new Chart(document.getElementById('" + id_canvas + "'), {"
+            "type:'line',"
+            "data:{labels:" + json.dumps(rotulos) + ",datasets:" + json.dumps(datasets_js) + "},"
+            "options:{responsive:true,"
+            "interaction:{mode:'nearest',axis:'x',intersect:false},"
+            "plugins:{legend:{position:'bottom'}},"
+            "scales:{x:{ticks:{maxTicksLimit:10,maxRotation:45}},"
+            "y:{title:{display:true,text:'" + info["unidade"] + "'}}}}});"
+        )
+        blocos_html.append(f"""
+        <section class="bloco">
+          <h2>{info['titulo']} ({info['unidade']})</h2>
+          <canvas id="{id_canvas}" height="110"></canvas>
+          <div class="wrapper">
+            <table class="stats">
+              <thead><tr><th>Fonte</th><th>Média</th><th>Mín.</th><th>Máx.</th>
+                         <th>Tendência</th><th>Pontos</th><th>Período</th></tr></thead>
+              <tbody>{''.join(linhas_stats)}</tbody>
+            </table>
+          </div>
+          <script>{script}</script>
+        </section>""")
+
+    if not blocos_html:
+        return ("<h1>Ainda não há temperatura, umidade ou radiação reconhecíveis nas fontes. "
+                "<a href='/'>Voltar</a></h1>")
+
+    pagina = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Gráficos e tendências — Clima Unificado</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f2f5; }
+        h1 { color: #1565C0; margin-bottom: 4px; }
+        a.voltar { font-size: 13px; color: #1565C0; text-decoration: none; }
+        .bloco { background: white; border-radius: 10px; padding: 16px 20px;
+                 margin: 18px 0; box-shadow: 0 1px 4px rgba(0,0,0,.1); }
+        .bloco h2 { margin-top: 0; color: #333; font-size: 18px; }
+        .wrapper { overflow-x: auto; margin-top: 14px; }
+        table.stats { border-collapse: collapse; width: 100%; font-size: 12px; }
+        table.stats th { background: #1565C0; color: white; padding: 6px; }
+        table.stats td { border: 1px solid #ddd; padding: 5px 6px; text-align: center; white-space: nowrap; }
+    </style>
+</head>
+<body>
+    <a class="voltar" href="/">← Voltar para a tabela</a>
+    <h1>📊 Gráficos e tendências</h1>
+    __CORPO__
+</body>
+</html>"""
+    return pagina.replace("__CORPO__", "\n".join(blocos_html))
+
+@app.route("/status")
+def status():
+    """Usado pelo UptimeRobot para manter o serviço acordado e checar a saúde das fontes."""
+    from flask import jsonify
+
+    with tabela_lock:
+        df_copia = tabela.copy()
+        atualizada = ultima_atualizacao
+
+    with _diagnostico_lock:
+        diag = {
+            fonte: {
+                "ok": info["ok"],
+                "registros": info["registros"],
+                "detalhe": info["detalhe"],
+                "hora": info["hora"].strftime("%d/%m/%Y %H:%M:%S"),
+            }
+            for fonte, info in _diagnostico.items()
+        }
+
+    return jsonify({
+        "status": "ok",
+        "ultima_atualizacao": atualizada.strftime("%d/%m/%Y %H:%M:%S") if atualizada else None,
+        "total_registros": int(len(df_copia)),
+        "data_mais_recente_por_fonte": _data_mais_recente_por_fonte(df_copia),
+        "diagnostico": diag,
+    })
 
 # ==========================================================
-# EXECUÇÃO PRINCIPAL
+# INICIALIZAÇÃO
 # ==========================================================
 
 if __name__ == "__main__":
-    log.info("Buscando dados iniciais...")
-    atualizar_dados()
-
+    # Coleta inicial em segundo plano, para a porta abrir logo
+    threading.Thread(target=atualizar_dados, daemon=True).start()
+    # Agendador (atualização a cada INTERVALO_ATUALIZACAO_HORAS)
     threading.Thread(target=agendador, daemon=True).start()
 
-    porta = int(os.environ.get("PORT", 5000))
-    log.info(f"Servidor iniciado na porta {porta}")
-    if GSHEETS_ATIVO:
-        log.info(f"PLANILHA GOOGLE SHEETS: {GSHEETS_LINK}")
-    app.run(host="0.0.0.0", port=porta, threaded=True)
+    porta = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=porta)
