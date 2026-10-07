@@ -983,32 +983,65 @@ def agendador():
 
 app = Flask(__name__)
 
+def _svg_linha(rotulos, series, titulo):
+    """
+    Gráfico de linhas em SVG puro (sem JavaScript nem CDN).
+    series: lista de (nome, cor, valores).
+    """
+    import math
+    W, H, L, R, T, B = 860, 320, 48, 20, 42, 40
+    todos = [v for _, _, vals in series for v in vals]
+    ymin, ymax = math.floor(min(todos)) - 1, math.ceil(max(todos)) + 1
+    pw, ph, n = W - L - R, H - T - B, len(rotulos)
+
+    def x(i):
+        return L + (pw / 2 if n == 1 else i * pw / (n - 1))
+
+    def y(v):
+        return T + ph - (v - ymin) / (ymax - ymin) * ph
+
+    s = [f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" font-family="Arial" font-size="11">',
+         f'<text x="{W/2}" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#333">{titulo}</text>']
+    for k in range(5):
+        v = ymin + (ymax - ymin) * k / 4
+        yy = y(v)
+        s.append(f'<line x1="{L}" y1="{yy:.1f}" x2="{W-R}" y2="{yy:.1f}" stroke="#e0e0e0"/>')
+        s.append(f'<text x="{L-6}" y="{yy+4:.1f}" text-anchor="end" fill="#666">{v:.0f}°</text>')
+    passo = max(1, math.ceil(n / 8))
+    for i, r in enumerate(rotulos):
+        if i % passo == 0:
+            s.append(f'<text x="{x(i):.1f}" y="{H-B+16}" text-anchor="middle" fill="#666">{str(r)[-5:]}</text>')
+    for nome, cor, vals in series:
+        pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(vals))
+        s.append(f'<polyline points="{pts}" fill="none" stroke="{cor}" stroke-width="2.5"/>')
+        for i, v in enumerate(vals):
+            s.append(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="3" fill="{cor}"><title>{rotulos[i]}: {v:.1f}°C</title></circle>')
+    lx = L
+    for nome, cor, _ in series:
+        s.append(f'<rect x="{lx}" y="{H-14}" width="12" height="4" fill="{cor}"/>'
+                 f'<text x="{lx+16}" y="{H-9}" fill="#333">{nome}</text>')
+        lx += 90
+    s.append("</svg>")
+    return "".join(s)
+
 def _html_graficos(df):
-    """
-    Gráficos da aba "📈 Gráficos" da interface. Desenhados no navegador
-    com Chart.js a partir dos mesmos dados de _dados_graficos(); o
-    servidor só serializa os números (não monta tabela nem usa o Sheets).
-    """
+    """Gráficos da aba "📈 Gráficos": SVG gerado no servidor, sem dependências externas."""
     horas, dias = _dados_graficos(df)
     if not horas and not dias:
         return "<p>Sem dados do Open-Meteo ainda.</p>"
-    return f"""
-    <div class="graf"><canvas id="g1"></canvas></div>
-    <div class="graf"><canvas id="g2"></canvas></div>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-    <script>
-    const H = {json.dumps(horas)}, D = {json.dumps(dias)};
-    new Chart(document.getElementById('g1'), {{type:'line', data:{{
-      labels: H.map(r => r[0]),
-      datasets:[{{label:'Temperatura (°C)', data:H.map(r => r[1]), borderColor:'#1565C0', tension:.3}}]}},
-      options:{{plugins:{{title:{{display:true, text:'Temperatura hoje (hora a hora) — Open-Meteo'}}}}}}}});
-    new Chart(document.getElementById('g2'), {{type:'line', data:{{
-      labels: D.map(r => r[0]),
-      datasets:[
-        {{label:'Máx (°C)', data:D.map(r => r[1]), borderColor:'#E53935', tension:.3}},
-        {{label:'Mín (°C)', data:D.map(r => r[2]), borderColor:'#1E88E5', tension:.3}}]}},
-      options:{{plugins:{{title:{{display:true, text:'Máxima e mínima da semana — Open-Meteo'}}}}}}}});
-    </script>"""
+    html = ""
+    if horas:
+        html += '<div class="graf">' + _svg_linha(
+            [r[0] for r in horas],
+            [("Temperatura (°C)", "#1565C0", [r[1] for r in horas])],
+            "Temperatura hoje (hora a hora) — Open-Meteo") + "</div>"
+    if dias:
+        html += '<div class="graf">' + _svg_linha(
+            [r[0] for r in dias],
+            [("Máx (°C)", "#E53935", [r[1] for r in dias]),
+             ("Mín (°C)", "#1E88E5", [r[2] for r in dias])],
+            "Máxima e mínima da semana — Open-Meteo") + "</div>"
+    return html
 
 @app.route("/")
 def inicio():
@@ -1018,7 +1051,9 @@ def inicio():
     if df_atual.empty:
         return "<h1>Buscando os dados pela primeira vez... atualize a página em alguns segundos.</h1>"
 
-    fontes      = list(df_atual["Estacao"].unique())
+    # As duas abas do Open-Meteo aparecem sempre, mesmo se a coleta falhou
+    fixas       = ["Open-Meteo – Hoje (horário)", "Open-Meteo – Previsão (diária)"]
+    fontes      = fixas + [f for f in df_atual["Estacao"].unique() if f not in fixas]
     fonte_ativa = flask_request.args.get("fonte", "todas")
     eh_graf     = fonte_ativa == "graficos"
 
@@ -1027,6 +1062,12 @@ def inicio():
 
     if eh_graf:
         conteudo = _html_graficos(df_atual)
+    elif df_exibir.empty:
+        with _diagnostico_lock:
+            info = _diagnostico.get(fonte_ativa, {})
+        motivo = info.get("detalhe") or "ainda sem coleta"
+        conteudo = (f'<div class="msg-vazio">⚠️ Sem dados de <strong>{fonte_ativa}</strong> '
+                    f'neste momento. Motivo: {motivo}</div>')
     else:
         if fonte_ativa == "todas":
             colunas_mostrar = list(df_atual.columns)
@@ -1121,6 +1162,7 @@ def inicio():
         .src-sm-conv        {{ background: #F8BBD0; color: #880E4F; }}
         .src-comunidade     {{ background: #D1C4E9; color: #4527A0; }}
 
+        .msg-vazio {{ background: #FFF3E0; border: 1px solid #FFCC80; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: #E65100; max-width: 900px; }}
         .graf {{ background: white; border-radius: 8px; padding: 12px; margin-bottom: 16px; max-width: 900px; }}
 
         .wrapper {{ overflow-x: auto; }}
