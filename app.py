@@ -952,6 +952,8 @@ def atualizar_dados(forcar_inmet=False):
         else:
             log.warning("A atualização não trouxe dados novos; mantendo a tabela anterior.")
 
+    threading.Thread(target=_atualizar_historico_inmet, daemon=True).start()
+
     if GSHEETS_ATIVO:
         with tabela_lock:
             df_copia = tabela.copy()
@@ -983,14 +985,90 @@ def agendador():
 
 app = Flask(__name__)
 
+# ==========================================================
+# INMET HISTÓRICO — médias diárias (alimenta a aba "📈 Gráficos")
+# ==========================================================
+# Baixa o ZIP anual do INMET no máximo 1x a cada 24 h, em thread própria,
+# e guarda só a temperatura média de cada dia por estação (resumo pequeno).
+# Não entra na tabela unificada nem no Sheets, então quase não pesa.
+
+_historico_inmet    = {}     # cidade -> DataFrame[data, tmed]
+_historico_hora     = None
+_historico_rodando  = False
+_historico_lock     = threading.Lock()
+
+def _atualizar_historico_inmet():
+    global _historico_hora, _historico_rodando
+    with _historico_lock:
+        if _historico_rodando:
+            return
+        if _historico_hora and datetime.now() - _historico_hora < timedelta(hours=24):
+            return
+        _historico_rodando = True
+    try:
+        log.info("Atualizando histórico do INMET (médias diárias)...")
+        url = _resolver_url_inmet_zip(sessao_http)
+        resp = sessao_http.get(url, timeout=180)
+        resp.raise_for_status()
+        zf = zipfile.ZipFile(io.BytesIO(resp.content))
+        del resp
+        novo = {}
+        for codigo, cidade in ESTACOES.items():
+            for arq in zf.namelist():
+                if codigo not in arq:
+                    continue
+                df = pd.read_csv(
+                    zf.open(arq), sep=";", encoding="latin1", skiprows=8, decimal=",",
+                    usecols=lambda c: str(c).upper().startswith("DATA")
+                    or ("TEMPERATURA DO AR" in str(c).upper() and "BULBO" in str(c).upper()),
+                    low_memory=False,
+                )
+                col_d = encontrar_coluna(df.columns, "DATA")
+                col_t = encontrar_coluna(df.columns, "TEMPERATURA DO AR", "BULBO")
+                if col_d is None or col_t is None:
+                    continue
+                t = pd.to_numeric(df[col_t], errors="coerce")
+                t = t.where(t > -100)                      # -9999 = sem medição
+                d = pd.to_datetime(df[col_d], errors="coerce").dt.normalize()
+                g = pd.DataFrame({"data": d, "t": t}).dropna().groupby("data")["t"].agg(["mean", "count"])
+                g = g[g["count"] >= 12]                    # só dias com boa cobertura
+                if not g.empty:
+                    novo[cidade] = pd.DataFrame({"data": g.index, "tmed": g["mean"].values})
+                break
+        if novo:
+            with _historico_lock:
+                _historico_inmet.clear()
+                _historico_inmet.update(novo)
+                _historico_hora = datetime.now()
+            _marcar_diagnostico("INMET histórico (gráficos)", True,
+                                sum(len(v) for v in novo.values()), "médias diárias")
+            log.info("OK: histórico do INMET atualizado.")
+        else:
+            raise RuntimeError("nenhuma estação com temperatura encontrada no ZIP")
+    except Exception as e:
+        log.error(f"Erro ao atualizar histórico do INMET: {e}")
+        _marcar_diagnostico("INMET histórico (gráficos)", False, 0, str(e))
+        with _historico_lock:                              # tenta de novo em ~6 h
+            _historico_hora = datetime.now() - timedelta(hours=18)
+    finally:
+        with _historico_lock:
+            _historico_rodando = False
+
+# ==========================================================
+# GRÁFICOS SVG (gerados no servidor, sem JavaScript nem CDN)
+# ==========================================================
+
 def _svg_linha(rotulos, series, titulo):
     """
-    Gráfico de linhas em SVG puro (sem JavaScript nem CDN).
-    series: lista de (nome, cor, valores).
+    Gráfico de linhas em SVG puro.
+    series: lista de (nome, cor, valores[, tracejado]). Valores None
+    quebram a linha; séries com nome vazio não aparecem na legenda.
     """
     import math
     W, H, L, R, T, B = 860, 320, 48, 20, 42, 40
-    todos = [v for _, _, vals in series for v in vals]
+    todos = [v for it in series for v in it[2] if v is not None]
+    if not todos:
+        return ""
     ymin, ymax = math.floor(min(todos)) - 1, math.ceil(max(todos)) + 1
     pw, ph, n = W - L - R, H - T - B, len(rotulos)
 
@@ -1010,25 +1088,91 @@ def _svg_linha(rotulos, series, titulo):
     passo = max(1, math.ceil(n / 8))
     for i, r in enumerate(rotulos):
         if i % passo == 0:
-            s.append(f'<text x="{x(i):.1f}" y="{H-B+16}" text-anchor="middle" fill="#666">{str(r)[-5:]}</text>')
-    for nome, cor, vals in series:
-        pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(vals))
-        s.append(f'<polyline points="{pts}" fill="none" stroke="{cor}" stroke-width="2.5"/>')
+            s.append(f'<text x="{x(i):.1f}" y="{H-B+16}" text-anchor="middle" fill="#666">{r}</text>')
+
+    for it in series:
+        nome, cor, vals = it[:3]
+        tracejado = len(it) > 3 and it[3]
+        segmentos, atual = [], []
         for i, v in enumerate(vals):
-            s.append(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="3" fill="{cor}"><title>{rotulos[i]}: {v:.1f}°C</title></circle>')
+            if v is None:
+                if atual:
+                    segmentos.append(atual)
+                    atual = []
+            else:
+                atual.append((i, v))
+        if atual:
+            segmentos.append(atual)
+        for sg in segmentos:
+            pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in sg)
+            extra = ' stroke-dasharray="6 4"' if tracejado else ""
+            s.append(f'<polyline points="{pts}" fill="none" stroke="{cor}" '
+                     f'stroke-width="{1.8 if tracejado else 2.5}"{extra}/>')
+        if not tracejado:
+            for i, v in enumerate(vals):
+                if v is not None:
+                    s.append(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="3" fill="{cor}">'
+                             f'<title>{rotulos[i]}: {v:.1f}°C</title></circle>')
+
     lx = L
-    for nome, cor, _ in series:
-        s.append(f'<rect x="{lx}" y="{H-14}" width="12" height="4" fill="{cor}"/>'
-                 f'<text x="{lx+16}" y="{H-9}" fill="#333">{nome}</text>')
-        lx += 90
+    for it in series:
+        if it[0]:
+            s.append(f'<rect x="{lx}" y="{H-14}" width="12" height="4" fill="{it[1]}"/>'
+                     f'<text x="{lx+16}" y="{H-9}" fill="#333">{it[0]}</text>')
+            lx += 40 + 7 * len(it[0])
     s.append("</svg>")
     return "".join(s)
 
+_CORES_INMET = {
+    "Cachoeira do Sul":         "#2E7D32",
+    "Santa Maria Automática":   "#F9A825",
+    "Santa Maria Convencional": "#AD1457",
+}
+
+def _graficos_inmet():
+    """Média diária (últimos 60 dias) com linha de tendência, e média mensal."""
+    import numpy as np
+    with _historico_lock:
+        dados = {c: d.copy() for c, d in _historico_inmet.items()}
+    if not dados:
+        return ('<div class="msg-vazio">⏳ Histórico do INMET ainda carregando '
+                '(é baixado 1x por dia). Atualize a página em alguns instantes.</div>')
+
+    ultimo = max(d["data"].max() for d in dados.values())
+    dias   = pd.date_range(ultimo - pd.Timedelta(days=59), ultimo)
+    rot_d  = [d.strftime("%d/%m") for d in dias]
+    series, resumo = [], []
+    for cidade, d in dados.items():
+        cor  = _CORES_INMET.get(cidade, "#555")
+        ser  = d.set_index("data")["tmed"].reindex(dias)
+        vals = [None if pd.isna(v) else float(v) for v in ser]
+        series.append((cidade, cor, vals))
+        idx = [i for i, v in enumerate(vals) if v is not None]
+        if len(idx) >= 3:
+            a, b = np.polyfit(idx, [vals[i] for i in idx], 1)
+            series.append(("", cor, [a * i + b for i in range(len(vals))], True))
+            media = float(np.mean([vals[i] for i in idx]))
+            resumo.append(f"<strong>{cidade}</strong>: média {media:.1f}°C, tendência {a:+.2f}°C/dia")
+
+    html = '<div class="graf">' + _svg_linha(
+        rot_d, series, "Temperatura média diária — INMET (60 dias, tracejado = tendência)") + "</div>"
+    if resumo:
+        html += '<p class="resumo">' + " &nbsp;|&nbsp; ".join(resumo).replace(".", ",") + "</p>"
+
+    meses = sorted(set().union(*[set(d["data"].dt.to_period("M")) for d in dados.values()]))
+    rot_m = [f"{m.month:02d}/{str(m.year)[2:]}" for m in meses]
+    series_m = []
+    for cidade, d in dados.items():
+        m = d.groupby(d["data"].dt.to_period("M"))["tmed"].mean()
+        series_m.append((cidade, _CORES_INMET.get(cidade, "#555"),
+                         [float(m[p]) if p in m.index else None for p in meses]))
+    html += '<div class="graf">' + _svg_linha(
+        rot_m, series_m, "Temperatura média mensal — INMET") + "</div>"
+    return html
+
 def _html_graficos(df):
-    """Gráficos da aba "📈 Gráficos": SVG gerado no servidor, sem dependências externas."""
+    """Conteúdo da aba "📈 Gráficos": Open-Meteo (hoje e semana) + INMET (histórico)."""
     horas, dias = _dados_graficos(df)
-    if not horas and not dias:
-        return "<p>Sem dados do Open-Meteo ainda.</p>"
     html = ""
     if horas:
         html += '<div class="graf">' + _svg_linha(
@@ -1037,11 +1181,13 @@ def _html_graficos(df):
             "Temperatura hoje (hora a hora) — Open-Meteo") + "</div>"
     if dias:
         html += '<div class="graf">' + _svg_linha(
-            [r[0] for r in dias],
+            [r[0][5:] for r in dias],
             [("Máx (°C)", "#E53935", [r[1] for r in dias]),
              ("Mín (°C)", "#1E88E5", [r[2] for r in dias])],
             "Máxima e mínima da semana — Open-Meteo") + "</div>"
-    return html
+    if not horas and not dias:
+        html += '<div class="msg-vazio">⚠️ Open-Meteo sem dados neste momento (veja o motivo na aba do Open-Meteo).</div>'
+    return html + _graficos_inmet()
 
 @app.route("/")
 def inicio():
@@ -1163,6 +1309,7 @@ def inicio():
         .src-comunidade     {{ background: #D1C4E9; color: #4527A0; }}
 
         .msg-vazio {{ background: #FFF3E0; border: 1px solid #FFCC80; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: #E65100; max-width: 900px; }}
+        .resumo {{ font-size: 12px; color: #333; max-width: 900px; margin: -6px 0 16px; }}
         .graf {{ background: white; border-radius: 8px; padding: 12px; margin-bottom: 16px; max-width: 900px; }}
 
         .wrapper {{ overflow-x: auto; }}
