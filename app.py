@@ -1,24 +1,58 @@
 # ==========================================================
-# CLIMA UNIFICADO - INMET + OPEN-METEO (versão enxuta p/ Render free)
+# CLIMA UNIFICADO - INMET + OPEN-METEO
+# Versão robusta para deploy no Render + Google Sheets
 #
-# Fontes: Open-Meteo, INMET (API tempo real), Estação Meteorológica
-# (planilha externa) e Dados da Comunidade (CSV em /adicionar).
-# Destino: Google Sheets (abas Diagnóstico, Todas, Gráficos e por fonte).
+# COMO CONFIGURAR (leia antes de rodar):
 #
-# Economia de recursos nesta versão:
-# - Sem ZIP histórico do INMET (era o que estourava a memória).
-# - Planilhas externas limitadas às últimas LIMITE_LINHAS linhas.
-# - Tabela em memória sempre pequena.
-# - Dados da comunidade escapados (html.escape) ao exibir.
+# ── Google Sheets ────────────────────────────────────────
+#  1. Acesse https://console.cloud.google.com
+#  2. Crie um projeto > ative "Google Sheets API" e
+#     "Google Drive API"
+#  3. Crie uma "Service Account" e baixe o JSON de credenciais
+#  4. No Render, use "Secret Files" para subir esse JSON com o
+#     nome "credenciais.json" (fica em /etc/secrets/credenciais.json)
+#  5. Crie uma planilha no Google Sheets e compartilhe com
+#     o e-mail da Service Account (papel: Editor)
+#  6. Configure GSHEETS_NOME e GSHEETS_LINK como variáveis de
+#     ambiente no Render (ou deixe os valores padrão abaixo)
+#
+# O QUE MUDOU NESTA VERSÃO
+# ─────────────────────────────────────────────────────────
+#  • NOVO: aba "Gráficos" na planilha de destino, com dois gráficos
+#    de linha nativos do Google Sheets montados a partir dos dados do
+#    Open-Meteo: a variação da temperatura hora a hora de hoje e as
+#    máximas/mínimas dos próximos 7 dias. Os gráficos são criados uma
+#    única vez; nos ciclos seguintes só os números são reescritos e os
+#    gráficos se atualizam sozinhos.
+#  • MUDANÇA PRINCIPAL: o INMET agora é coletado pela API de TEMPO REAL
+#    (apitempo.inmet.gov.br), que devolve dado hora a hora direto da
+#    estação — assim como o Open-Meteo. O ZIP histórico anual (que passa
+#    por controle de qualidade e fica 1-3 semanas atrasado) só entra
+#    como RESERVA automática, caso a API de tempo real esteja fora do
+#    ar ou pare de responder para todas as estações.
+#  • O caminho de reserva (ZIP) continua comparando por HASH do
+#    conteúdo baixado (não cabeçalhos HTTP, que não são confiáveis).
+#  • Se o ZIP do ano corrente ainda não existir no INMET (comum no
+#    início de janeiro), o caminho de reserva cai para o ano anterior.
+#  • Chamadas de rede (Open-Meteo, INMET, Google Sheets) têm retries
+#    com backoff exponencial.
+#  • Logging estruturado (nível, hora) no lugar de print().
+#  • Google Sheets só reescreve uma aba se os dados dela realmente
+#    mudaram (evita bater no limite de requisições da API).
+#  • /status mostra a data/hora mais recente de cada fonte de dados,
+#    reconhecendo tanto os nomes de coluna do ZIP quanto da API.
+#  • Coleta de radiação solar (Open-Meteo hora a hora e previsão
+#    diária). Para o INMET e a Estação Meteorológica, a radiação já
+#    entra automaticamente se a fonte fornecer essa coluna — nada
+#    precisou mudar nesses dois caminhos.
 # ==========================================================
 
-import html
 import io
 import logging
 import os
 import threading
 import time
-import unicodedata
+import zipfile
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -26,6 +60,10 @@ import requests
 from flask import Flask, Response, request as flask_request
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# ==========================================================
+# LOGGING
+# ==========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,35 +73,70 @@ logging.basicConfig(
 log = logging.getLogger("clima")
 
 # ==========================================================
-# CONFIGURAÇÕES
+# ⚙️  CONFIGURAÇÕES PRINCIPAIS
 # ==========================================================
 
-LATITUDE = -30.0397
+LATITUDE  = -30.0397
 LONGITUDE = -52.8930
 
 ESTACOES = {
-    "B822": "Cachoeira do Sul",
-    "A803": "Santa Maria Automática",
+    "B822":  "Cachoeira do Sul",
+    "A803":  "Santa Maria Automática",
     "83936": "Santa Maria Convencional",
 }
 
-INTERVALO_ATUALIZACAO_HORAS = 1
-LIMITE_LINHAS = 1500  # máx. de linhas lidas das planilhas externas
+ANO_ATUAL = date.today().year
+URL_INMET_BASE = "https://portal.inmet.gov.br/uploads/dadoshistoricos/{ano}.zip"
 
-GSHEETS_ATIVO = True
+# De quantas em quantas horas o ciclo de atualização roda. Vale tanto para
+# Open-Meteo quanto para o INMET, já que agora o INMET usa a API de tempo
+# real (hora a hora), no mesmo ritmo do Open-Meteo. O ZIP histórico anual
+# só entra como reserva automática se a API do INMET falhar (veja a seção
+# "INMET" mais abaixo).
+INTERVALO_ATUALIZACAO_HORAS = 1
+
+# ── Google Sheets ────────────────────────────────────────
+GSHEETS_ATIVO       = True
 GSHEETS_CREDENCIAIS = os.environ.get("GSHEETS_CREDENCIAIS_PATH", "/etc/secrets/credenciais.json")
-GSHEETS_NOME = os.environ.get("GSHEETS_NOME", "Clima Unificado")
-GSHEETS_LINK = os.environ.get(
+GSHEETS_NOME        = os.environ.get("GSHEETS_NOME", "Clima Unificado")
+GSHEETS_LINK        = os.environ.get(
     "GSHEETS_LINK",
     "https://docs.google.com/spreadsheets/d/1yDFMkt0-Buuijc1LwVc6Sj8Zixk74cc0izi0azvT5sA/edit?gid=192990081#gid=192990081",
 )
 
+# ── Estação Meteorológica (planilha externa, fonte adicional) ──────
+# Essa é uma planilha DIFERENTE da planilha de destino acima — é onde
+# a estação física já registra os dados. O app só LÊ dela e copia os
+# dados para dentro da tabela unificada / da planilha de destino.
 ESTACAO_METEO_SHEET_ID = os.environ.get(
     "ESTACAO_METEO_SHEET_ID",
     "1t2ZztZ7zBMZD148G4Ib6USTTkVVe4hWnS-CGgEd7CQM",
 )
+# Nome da aba a ler dentro dessa planilha externa. Deixe em branco para
+# usar a primeira aba automaticamente.
 ESTACAO_METEO_ABA = os.environ.get("ESTACAO_METEO_ABA", "")
 
+# ==========================================================
+# FONTE → CLASSE CSS
+# ==========================================================
+
+FONTE_CSS = {
+    "Open-Meteo – Hoje (horário)":       "src-om-hora",
+    "Open-Meteo – Previsão (diária)":    "src-om-prev",
+    "INMET - Cachoeira do Sul":          "src-cachoeira",
+    "INMET - Santa Maria Automática":    "src-sm-auto",
+    "INMET - Santa Maria Convencional":  "src-sm-conv",
+    "Estação Meteorológica":             "src-estacao-meteo",
+    "Dados da Comunidade":               "src-comunidade",
+}
+
+# ── Dados da Comunidade (formulário público em /adicionar) ─────────
+# Qualquer pessoa com acesso ao site pode enviar seus próprios dados
+# meteorológicos pelo formulário público. Cada envio é gravado direto
+# numa aba própria ("Dados da Comunidade") dentro da MESMA planilha de
+# destino (GSHEETS_NOME) — não é uma planilha separada. Essa aba é
+# relida a cada ciclo (coletar_dados_comunidade) e entra na tabela
+# unificada, igual às outras fontes.
 DADOS_COMUNIDADE_ABA = "Dados da Comunidade"
 CAMPOS_COMUNIDADE = [
     "Nome/Apelido", "Cidade/Bairro", "Data", "Hora",
@@ -71,36 +144,15 @@ CAMPOS_COMUNIDADE = [
     "Precip. (mm)", "Radiação Solar (W/m²)", "Observação",
 ]
 
-FONTE_CSS = {
-    "Open-Meteo – Hoje (horário)": "src-om-hora",
-    "Open-Meteo – Previsão (diária)": "src-om-prev",
-    "INMET - Cachoeira do Sul": "src-cachoeira",
-    "INMET - Santa Maria Automática": "src-sm-auto",
-    "INMET - Santa Maria Convencional": "src-sm-conv",
-    "Estação Meteorológica": "src-estacao-meteo",
-    "Dados da Comunidade": "src-comunidade",
-}
-
-ICONES = {
-    "Open-Meteo – Hoje (horário)": "🕐",
-    "Open-Meteo – Previsão (diária)": "📅",
-    "Estação Meteorológica": "🌡️",
-    "Dados da Comunidade": "🙋",
-    "INMET - Cachoeira do Sul": "📡",
-    "INMET - Santa Maria Automática": "📡",
-    "INMET - Santa Maria Convencional": "📡",
-}
-
 # ==========================================================
-# HTTP COM RETRY
+# SESSÃO HTTP COM RETRY/BACKOFF
 # ==========================================================
-
 
 def criar_sessao():
     sessao = requests.Session()
     retry = Retry(
-        total=3,
-        backoff_factor=2,
+        total=4,
+        backoff_factor=2,          # 2s, 4s, 8s, 16s entre tentativas
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "HEAD"],
     )
@@ -109,54 +161,13 @@ def criar_sessao():
     sessao.mount("http://", adaptador)
     return sessao
 
-
 sessao_http = criar_sessao()
 
 # ==========================================================
-# DIAGNÓSTICO
+# OPEN-METEO: HOJE HORA A HORA
 # ==========================================================
-
-_diagnostico_lock = threading.Lock()
-_diagnostico = {}
-
-
-def _marcar_diagnostico(fonte, ok, registros=0, detalhe=""):
-    with _diagnostico_lock:
-        _diagnostico[fonte] = {
-            "ok": ok,
-            "registros": registros,
-            "detalhe": detalhe,
-            "hora": datetime.now(),
-        }
-
-
-def montar_aba_diagnostico():
-    agora = datetime.now()
-    linhas = [{
-        "Fonte": "── ÚLTIMA EXECUÇÃO DO CICLO ──",
-        "Status": "🟢 RODANDO",
-        "Registros": "",
-        "Detalhe": f"Ciclo iniciado às {agora.strftime('%d/%m/%Y %H:%M:%S')}",
-        "Checado em": agora.strftime("%d/%m/%Y %H:%M:%S"),
-    }]
-    with _diagnostico_lock:
-        for fonte, info in sorted(_diagnostico.items()):
-            linhas.append({
-                "Fonte": fonte,
-                "Status": "✅ OK" if info["ok"] else "❌ FALHOU",
-                "Registros": info["registros"],
-                "Detalhe": info["detalhe"],
-                "Checado em": info["hora"].strftime("%d/%m/%Y %H:%M:%S"),
-            })
-    return pd.DataFrame(linhas)
-
-# ==========================================================
-# OPEN-METEO
-# ==========================================================
-
 
 def coletar_om_horario():
-    fonte = "Open-Meteo – Hoje (horário)"
     log.info("Buscando Open-Meteo – hoje hora a hora...")
     hoje = date.today().isoformat()
     url = (
@@ -168,31 +179,35 @@ def coletar_om_horario():
         f"&timezone=America/Sao_Paulo"
     )
     try:
-        h = sessao_http.get(url, timeout=30).json()["hourly"]
+        dados = sessao_http.get(url, timeout=30).json()
+        h = dados["hourly"]
         linhas = []
         for i, hora in enumerate(h["time"]):
             linhas.append({
-                "Estacao": fonte,
-                "Data": hora[:10],
-                "Hora": hora[11:] + ":00",
+                "Estacao":          "Open-Meteo – Hoje (horário)",
+                "Data":             hora[:10],
+                "Hora":             hora[11:] + ":00",
                 "Temperatura (°C)": h["temperature_2m"][i],
-                "Umidade (%RH)": h["relative_humidity_2m"][i],
-                "Vento (km/h)": h["wind_speed_10m"][i],
-                "Precip. (mm)": h["precipitation"][i],
-                "Cód. Clima": h["weather_code"][i],
+                "Umidade (%RH)":    h["relative_humidity_2m"][i],
+                "Vento (km/h)":     h["wind_speed_10m"][i],
+                "Precip. (mm)":     h["precipitation"][i],
+                "Cód. Clima":       h["weather_code"][i],
                 "Radiação Solar (W/m²)": h["shortwave_radiation"][i],
             })
+        log.info(f"OK: {len(linhas)} horas do dia de hoje (Open-Meteo)")
         df = pd.DataFrame(linhas)
-        _marcar_diagnostico(fonte, True, len(df))
+        _marcar_diagnostico("Open-Meteo – Hoje (horário)", True, len(df))
         return df
     except Exception as e:
         log.error(f"Erro Open-Meteo horário: {e}")
-        _marcar_diagnostico(fonte, False, 0, str(e))
+        _marcar_diagnostico("Open-Meteo – Hoje (horário)", False, 0, str(e))
         return pd.DataFrame()
 
+# ==========================================================
+# OPEN-METEO: PREVISÃO DIÁRIA (próximos 16 dias)
+# ==========================================================
 
 def coletar_om_diario():
-    fonte = "Open-Meteo – Previsão (diária)"
     log.info("Buscando Open-Meteo – previsão diária...")
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
@@ -204,38 +219,44 @@ def coletar_om_diario():
         f"&timezone=America/Sao_Paulo"
     )
     try:
-        d = sessao_http.get(url, timeout=30).json()["daily"]
+        dados = sessao_http.get(url, timeout=30).json()
+        d = dados["daily"]
         linhas = []
         for i, dia in enumerate(d["time"]):
             linhas.append({
-                "Estacao": fonte,
-                "Data": dia,
-                "Hora": "—",
-                "Temp. Máx (°C)": d["temperature_2m_max"][i],
-                "Temp. Mín (°C)": d["temperature_2m_min"][i],
-                "Precip. (mm)": d["precipitation_sum"][i],
-                "Vento Máx (km/h)": d["wind_speed_10m_max"][i],
-                "Cód. Clima": d["weather_code"][i],
-                "Nascer do Sol": d["sunrise"][i],
-                "Pôr do Sol": d["sunset"][i],
+                "Estacao":           "Open-Meteo – Previsão (diária)",
+                "Data":              dia,
+                "Hora":              "—",
+                "Temp. Máx (°C)":    d["temperature_2m_max"][i],
+                "Temp. Mín (°C)":    d["temperature_2m_min"][i],
+                "Precip. (mm)":      d["precipitation_sum"][i],
+                "Vento Máx (km/h)":  d["wind_speed_10m_max"][i],
+                "Cód. Clima":        d["weather_code"][i],
+                "Nascer do Sol":     d["sunrise"][i],
+                "Pôr do Sol":        d["sunset"][i],
                 "Radiação Solar (MJ/m²)": d["shortwave_radiation_sum"][i],
             })
+        log.info(f"OK: {len(linhas)} dias de previsão (Open-Meteo)")
         df = pd.DataFrame(linhas)
-        _marcar_diagnostico(fonte, True, len(df))
+        _marcar_diagnostico("Open-Meteo – Previsão (diária)", True, len(df))
         return df
     except Exception as e:
         log.error(f"Erro Open-Meteo diário: {e}")
-        _marcar_diagnostico(fonte, False, 0, str(e))
+        _marcar_diagnostico("Open-Meteo – Previsão (diária)", False, 0, str(e))
         return pd.DataFrame()
 
 # ==========================================================
-# GSPREAD
+# GSPREAD — CLIENTE COMPARTILHADO
 # ==========================================================
 
 _gspread_cliente_cache = None
 
-
 def _obter_cliente_gspread():
+    """
+    Cria (uma única vez) e reutiliza o cliente autenticado do gspread,
+    tanto para ler a planilha da Estação Meteorológica quanto para
+    escrever na planilha de destino.
+    """
     global _gspread_cliente_cache
     if _gspread_cliente_cache is not None:
         return _gspread_cliente_cache
@@ -255,14 +276,29 @@ def _obter_cliente_gspread():
     return _gspread_cliente_cache
 
 # ==========================================================
-# ESTAÇÃO METEOROLÓGICA (planilha externa)
+# ESTAÇÃO METEOROLÓGICA (planilha externa, fonte adicional)
 # ==========================================================
 
-
 def coletar_estacao_meteorologica():
+    """
+    Lê os dados já lançados na planilha da estação meteorológica física
+    e devolve como DataFrame, com a coluna "Estacao" preenchida, para
+    entrar junto na tabela unificada.
+
+    IMPORTANTE: essa planilha externa precisa estar compartilhada (papel:
+    Leitor ou Editor) com o e-mail da mesma Service Account usada nas
+    outras credenciais do Google Sheets — senão a leitura falha com erro
+    de permissão.
+
+    Se a planilha da estação já tiver uma coluna de radiação solar (por
+    exemplo, vinda de um piranômetro/sensor físico), ela entra automati-
+    camente aqui junto com as demais colunas — não precisa de nenhuma
+    mudança neste trecho.
+    """
     if not ESTACAO_METEO_SHEET_ID:
         return pd.DataFrame()
-    fonte = "Estação Meteorológica"
+
+    log.info("Buscando dados da Estação Meteorológica (planilha externa)...")
     try:
         gc = _obter_cliente_gspread()
         sh = gc.open_by_key(ESTACAO_METEO_SHEET_ID)
@@ -271,28 +307,32 @@ def coletar_estacao_meteorologica():
         if not registros:
             log.warning("Planilha da Estação Meteorológica está vazia.")
             return pd.DataFrame()
-        df = pd.DataFrame(registros[-LIMITE_LINHAS:])
-        del registros
-        df.insert(0, "Estacao", fonte)
-        _marcar_diagnostico(fonte, True, len(df))
+        df = pd.DataFrame(registros)
+        df.insert(0, "Estacao", "Estação Meteorológica")
+        log.info(f"OK: {len(df)} registros da Estação Meteorológica")
+        _marcar_diagnostico("Estação Meteorológica", True, len(df))
         return df
     except Exception as e:
         log.error(f"Erro ao ler a planilha da Estação Meteorológica: {e}")
-        _marcar_diagnostico(fonte, False, 0, str(e))
+        _marcar_diagnostico("Estação Meteorológica", False, 0, str(e))
         return pd.DataFrame()
 
 # ==========================================================
-# DADOS DA COMUNIDADE
+# DADOS DA COMUNIDADE (formulário público em /adicionar)
 # ==========================================================
 
-
 def coletar_dados_comunidade():
+    """
+    Relê a aba "Dados da Comunidade" (mesma planilha de destino) e devolve
+    como DataFrame, para entrar junto na tabela unificada. Cada envio do
+    formulário público já grava direto nessa aba (ver _salvar_dado_comunidade
+    e a rota /adicionar); esta função só busca o que já está lá.
+    """
     if not GSHEETS_ATIVO:
         return pd.DataFrame()
 
     import gspread
 
-    fonte = "Dados da Comunidade"
     try:
         gc = _obter_cliente_gspread()
         sh = gc.open(GSHEETS_NOME)
@@ -303,28 +343,39 @@ def coletar_dados_comunidade():
         registros = ws.get_all_records()
         if not registros:
             return pd.DataFrame()
-        df = pd.DataFrame(registros[-LIMITE_LINHAS:])
-        del registros
-        df.insert(0, "Estacao", fonte)
-        _marcar_diagnostico(fonte, True, len(df))
+        df = pd.DataFrame(registros)
+        df.insert(0, "Estacao", "Dados da Comunidade")
+        _marcar_diagnostico("Dados da Comunidade", True, len(df))
         return df
     except Exception as e:
         log.error(f"Erro ao ler dados da comunidade: {e}")
-        _marcar_diagnostico(fonte, False, 0, str(e))
+        _marcar_diagnostico("Dados da Comunidade", False, 0, str(e))
         return pd.DataFrame()
 
-
 def _salvar_dados_comunidade(linhas):
+    """
+    Grava várias linhas de uma vez (append_rows) na aba "Dados da
+    Comunidade", criando a aba com o cabeçalho se ainda não existir.
+    Chamada pela rota /adicionar depois que o CSV enviado é processado.
+
+    Como agora qualquer CSV é aceito (não só o formato fixo de
+    CAMPOS_COMUNIDADE), o cabeçalho da aba é ajustado dinamicamente:
+    colunas novas trazidas por um envio são acrescentadas ao final do
+    cabeçalho já existente, sem apagar nem reordenar o que já estava lá.
+    """
     if not linhas:
         return
     if not GSHEETS_ATIVO:
-        raise RuntimeError("Google Sheets desativado.")
+        raise RuntimeError("Google Sheets desativado; não é possível salvar envios do formulário.")
 
     import gspread
 
     gc = _obter_cliente_gspread()
     sh = gc.open(GSHEETS_NOME)
 
+    # Colunas trazidas por este envio específico, na ordem em que
+    # aparecem nas linhas (já vem com as conhecidas primeiro, veja
+    # _processar_csv_comunidade).
     colunas_envio = []
     for linha in linhas:
         for col in linha.keys():
@@ -340,13 +391,20 @@ def _salvar_dados_comunidade(linhas):
         )
         cabecalho_atual = []
 
-    cabecalho_final = cabecalho_atual + [c for c in colunas_envio if c not in cabecalho_atual]
+    colunas_novas   = [c for c in colunas_envio if c not in cabecalho_atual]
+    cabecalho_final = cabecalho_atual + colunas_novas
+
     if cabecalho_final != cabecalho_atual:
         ws.update([cabecalho_final])
 
     valores = [[str(linha.get(campo, "")) for campo in cabecalho_final] for linha in linhas]
     ws.append_rows(valores)
 
+# ── Reconhecimento das colunas do CSV enviado pela pessoa ──────────
+# As pessoas podem exportar a planilha delas com nomes de coluna
+# ligeiramente diferentes (com/sem acento, maiúsculas, "temp" em vez de
+# "temperatura", etc). Este dicionário normaliza tudo pro nome oficial
+# usado na aba "Dados da Comunidade".
 
 ALIASES_COMUNIDADE = {
     "nome": "Nome/Apelido", "apelido": "Nome/Apelido", "nome/apelido": "Nome/Apelido",
@@ -368,11 +426,14 @@ ALIASES_COMUNIDADE = {
     "comentario": "Observação", "comentarios": "Observação",
 }
 
-
 def _normalizar_texto(txt):
+    """Minúsculas, sem acento e sem espaços nas pontas — usado para casar
+    nomes de coluna do CSV com ALIASES_COMUNIDADE, mesmo com pequenas
+    diferenças de grafia."""
+    import unicodedata
     txt = str(txt).strip().lower()
-    return "".join(c for c in unicodedata.normalize("NFKD", txt) if not unicodedata.combining(c))
-
+    txt = "".join(c for c in unicodedata.normalize("NFKD", txt) if not unicodedata.combining(c))
+    return txt
 
 def _mapear_colunas_csv(df):
     renomear = {}
@@ -382,8 +443,24 @@ def _mapear_colunas_csv(df):
             renomear[col] = ALIASES_COMUNIDADE[chave]
     return df.rename(columns=renomear)
 
-
 def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
+    """
+    Lê o CSV enviado pela pessoa e devolve uma lista de linhas prontas
+    para gravar na aba "Dados da Comunidade", além do total de linhas
+    lidas e de quantas foram ignoradas (só as completamente vazias).
+
+    ACEITA QUALQUER CSV, com qualquer conjunto de colunas — não exige
+    mais nenhuma coluna específica (antes "Cidade/Bairro" e
+    "Temperatura (°C)" eram obrigatórias). Colunas com nomes reconhecidos
+    (ver ALIASES_COMUNIDADE) continuam sendo renomeadas para o padrão
+    usado no resto do app (ex.: "temp" → "Temperatura (°C)"); qualquer
+    outra coluna do arquivo é mantida do jeito que veio e passa a
+    aparecer normalmente na tabela unificada, como uma coluna a mais.
+
+    Aceita separador por vírgula ou ponto e vírgula (detecção automática)
+    e tenta UTF-8 antes de cair para Latin-1 (comum em CSV exportado do
+    Excel no Brasil).
+    """
     texto = None
     for encoding in ("utf-8-sig", "latin1"):
         try:
@@ -404,6 +481,9 @@ def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
     agora = datetime.now()
     total = len(df)
 
+    # Nome/Apelido, Data e Hora sempre recebem um valor padrão quando
+    # ausentes ou em branco, pra toda linha ficar identificável e
+    # ordenável na tabela unificada — mas nenhuma outra coluna é exigida.
     if "Nome/Apelido" not in df.columns:
         df["Nome/Apelido"] = ""
     df.loc[df["Nome/Apelido"] == "", "Nome/Apelido"] = nome_padrao or "Anônimo"
@@ -416,31 +496,60 @@ def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
         df["Hora"] = ""
     df.loc[df["Hora"] == "", "Hora"] = agora.strftime("%H:%M")
 
+    # Reordena só pra ficar mais legível: colunas conhecidas primeiro,
+    # colunas extras do CSV original depois, na ordem em que vieram.
     ordem_conhecida = [c for c in CAMPOS_COMUNIDADE if c in df.columns]
-    extras = [c for c in df.columns if c not in CAMPOS_COMUNIDADE]
+    extras          = [c for c in df.columns if c not in CAMPOS_COMUNIDADE]
     df = df[ordem_conhecida + extras]
 
     linhas_validas = []
     for _, row in df.iterrows():
         linha = row.to_dict()
-        outros = [v for k, v in linha.items() if k not in ("Nome/Apelido", "Data", "Hora")]
-        if outros and not any(v.strip() for v in outros):
+        # Uma linha só é ignorada se estiver 100% vazia fora de
+        # Nome/Apelido, Data e Hora (que já vêm preenchidos por padrão
+        # acima e não indicam, sozinhos, que a linha tem dado real).
+        outros_valores = [v for k, v in linha.items() if k not in ("Nome/Apelido", "Data", "Hora")]
+        if outros_valores and not any(v.strip() for v in outros_valores):
             continue
         linhas_validas.append(linha)
 
-    return linhas_validas, total, total - len(linhas_validas)
+    ignoradas = total - len(linhas_validas)
+    return linhas_validas, total, ignoradas
 
 # ==========================================================
-# INMET (API de tempo real)
+# INMET — API de tempo real (fonte principal) + ZIP anual (reserva)
 # ==========================================================
+#
+# O INMET tem duas fontes bem diferentes:
+#   1) API de tempo real (apitempo.inmet.gov.br) — dado hora a hora,
+#      direto da estação, sem passar pelo controle de qualidade demorado.
+#      É esta que faz o INMET atualizar "como o Open-Meteo".
+#   2) ZIP histórico anual (dadoshistoricos) — passa por controle de
+#      qualidade, por isso fica 1-3 semanas atrasado. Usado aqui só como
+#      RESERVA, caso a API de tempo real esteja fora do ar ou tenha
+#      mudado de contrato (isso já aconteceu antes com bibliotecas que
+#      dependem dela, então a checagem por hash de conteúdo continua
+#      valendo para esse caminho de reserva).
+#
+# Ambas as fontes do INMET já trazem sua própria coluna de radiação solar
+# global quando disponível (ex.: "RAD_GLO" na API de tempo real, ou
+# "RADIACAO GLOBAL (Kj/m²)" no ZIP histórico). Como o código abaixo só
+# repassa todas as colunas que a fonte devolve, essa radiação já aparece
+# na tabela unificada sem precisar de nenhuma alteração aqui.
 
 URL_INMET_API_BASE = "https://apitempo.inmet.gov.br/estacao/{inicio}/{fim}/{codigo}"
 
-
-def coletar_inmet():
-    hoje = date.today()
-    inicio = (hoje - timedelta(days=2)).isoformat()
-    fim = hoje.isoformat()
+def coletar_inmet_api():
+    """
+    Busca o dado hora a hora mais recente de cada estação via API de
+    tempo real do INMET. Pede os últimos 2 dias (não só "hoje") como
+    margem de segurança contra atraso de transmissão da estação/fuso.
+    Retorna um DataFrame vazio se a API não responder para NENHUMA
+    estação (sinal de que ela pode estar fora do ar/mudou de contrato).
+    """
+    hoje    = date.today()
+    inicio  = (hoje - timedelta(days=2)).isoformat()
+    fim     = hoje.isoformat()
 
     blocos = []
     for codigo, cidade in ESTACOES.items():
@@ -451,20 +560,123 @@ def coletar_inmet():
             resp.raise_for_status()
             registros = resp.json()
             if not registros or not isinstance(registros, list):
-                _marcar_diagnostico(fonte_diag, False, 0, "resposta vazia")
+                log.warning(f"API de tempo real do INMET sem dados para {cidade} ({codigo}) no período pedido.")
+                _marcar_diagnostico(fonte_diag, False, 0, "resposta vazia/sem lista")
                 continue
             df = pd.DataFrame(registros)
+            if df.empty:
+                _marcar_diagnostico(fonte_diag, False, 0, "DataFrame vazio")
+                continue
             df.insert(0, "Estacao", f"INMET - {cidade}")
             blocos.append(df)
             _marcar_diagnostico(fonte_diag, True, len(df))
+            log.info(f"OK: INMET (API tempo real) - {cidade}: {len(df)} registros")
         except Exception as e:
-            log.warning(f"Erro API INMET {cidade} ({codigo}): {e}")
+            log.warning(f"Erro ao consultar API de tempo real do INMET para {cidade} ({codigo}): {e}")
             _marcar_diagnostico(fonte_diag, False, 0, str(e))
 
     if not blocos:
         return pd.DataFrame()
     return pd.concat(blocos, ignore_index=True)
 
+# ── Reserva: ZIP histórico anual, com checagem por hash de conteúdo ──
+
+_inmet_zip_hash_cache = {}
+_inmet_zip_url_ativa  = None
+
+def _resolver_url_inmet_zip(sessao):
+    global _inmet_zip_url_ativa
+    candidatos = [ANO_ATUAL, ANO_ATUAL - 1]
+    for ano in candidatos:
+        url = URL_INMET_BASE.format(ano=ano)
+        try:
+            sessao.head(url, timeout=30, allow_redirects=True).raise_for_status()
+            if _inmet_zip_url_ativa != url:
+                log.info(f"Usando ZIP do INMET (reserva): {ano}")
+            _inmet_zip_url_ativa = url
+            return url
+        except Exception:
+            log.warning(f"ZIP do INMET para {ano} indisponível, tentando outro ano...")
+    raise RuntimeError("Nenhum ZIP do INMET disponível (ano atual nem anterior).")
+
+def coletar_inmet_zip_reserva(forcar=False):
+    """
+    Caminho de reserva: baixa o ZIP histórico anual e só reprocessa se o
+    CONTEÚDO mudou (hash SHA-256) desde a última vez. Só é chamado quando
+    a API de tempo real falha para todas as estações.
+    """
+    import hashlib
+
+    try:
+        url = _resolver_url_inmet_zip(sessao_http)
+    except Exception as e:
+        log.error(f"Erro ao resolver URL do ZIP do INMET: {e}")
+        return pd.DataFrame()
+
+    log.info("Baixando ZIP do INMET (reserva) para checagem...")
+    try:
+        resposta = sessao_http.get(url, timeout=180)
+        resposta.raise_for_status()
+        conteudo = resposta.content
+    except Exception as e:
+        log.error(f"Erro ao baixar ZIP do INMET (reserva): {e}")
+        return pd.DataFrame()
+
+    hash_atual    = hashlib.sha256(conteudo).hexdigest()
+    hash_anterior = _inmet_zip_hash_cache.get(url)
+
+    if not forcar and hash_anterior == hash_atual:
+        log.info("INMET (reserva): conteúdo do ZIP idêntico ao da última coleta.")
+        return pd.DataFrame()
+
+    try:
+        zip_file = zipfile.ZipFile(io.BytesIO(conteudo))
+        arquivos = zip_file.namelist()
+        dados = []
+        for codigo, cidade in ESTACOES.items():
+            for arq in arquivos:
+                if codigo in arq:
+                    try:
+                        df = pd.read_csv(
+                            zip_file.open(arq),
+                            sep=";", encoding="latin1",
+                            skiprows=8, low_memory=False,
+                        )
+                        df.insert(0, "Estacao", f"INMET - {cidade}")
+                        dados.append(df)
+                        log.info(f"OK: INMET (reserva/ZIP) - {cidade}")
+                    except Exception as e:
+                        log.error(f"Erro ao processar estação {cidade} (reserva/ZIP): {e}")
+
+        if not dados:
+            return pd.DataFrame()
+
+        _inmet_zip_hash_cache[url] = hash_atual
+        return pd.concat(dados, ignore_index=True)
+    except Exception as e:
+        log.error(f"Erro ao processar ZIP do INMET (reserva): {e}")
+        return pd.DataFrame()
+
+def coletar_inmet(forcar=False):
+    """
+    Ponto de entrada único usado por montar_tabela(). Tenta a API de
+    tempo real primeiro (dado hora a hora). Se ela não devolver nada
+    para nenhuma estação, cai automaticamente para o ZIP histórico como
+    reserva. Retorna: (DataFrame, houve_atualizacao: bool)
+    """
+    df_api = coletar_inmet_api()
+    if not df_api.empty:
+        _marcar_diagnostico("INMET (fonte usada)", True, len(df_api), "API de tempo real")
+        return df_api, True
+
+    log.warning("API de tempo real do INMET não retornou dados para nenhuma estação; "
+                "usando ZIP histórico como reserva.")
+    df_zip = coletar_inmet_zip_reserva(forcar=forcar)
+    if not df_zip.empty:
+        _marcar_diagnostico("INMET (fonte usada)", True, len(df_zip), "ZIP histórico (reserva)")
+    else:
+        _marcar_diagnostico("INMET (fonte usada)", False, 0, "API e ZIP falharam/sem novidade")
+    return df_zip, (not df_zip.empty)
 
 def encontrar_coluna(colunas, *chaves):
     for col in colunas:
@@ -474,121 +686,91 @@ def encontrar_coluna(colunas, *chaves):
     return None
 
 # ==========================================================
-# ANÁLISE PARA /graficos
+# ESTADO COMPARTILHADO
 # ==========================================================
 
-METRICAS_HISTORICAS = {
-    "temperatura": {
-        "titulo": "Temperatura", "unidade": "°C",
-        "candidatos_col": [("TEMPERATURA",), ("TEM", "INS"), ("TEM", "MED"),
-                           ("TEMP", "MEDIA"), ("TEMP", "MÉDIA"), ("TEMP", "MAX")],
-    },
-    "umidade": {
-        "titulo": "Umidade Relativa", "unidade": "%",
-        "candidatos_col": [("UMIDADE",), ("UMD", "INS"), ("UMD", "MED"), ("UMID", "MEDIA")],
-    },
-    "radiacao": {
-        "titulo": "Radiação Solar", "unidade": "W/m²",
-        "candidatos_col": [("RADIAÇÃO",), ("RADIACAO",), ("RAD", "GLO"), ("RADGLO", "MEDIA")],
-    },
-}
-
-_CANDIDATOS_COL_DATA = [("DATA", "HORA"), ("DT", "MEDICAO"), ("DATA",)]
-
-
-def _achar_coluna(df, candidatos):
-    for chaves in candidatos:
-        col = encontrar_coluna(df.columns, *chaves)
-        if col is not None:
-            return col
-    return None
-
-
-def extrair_serie_metrica(df_fonte, metrica, limite_pontos=60):
-    info = METRICAS_HISTORICAS[metrica]
-    colunas_com_dado = [c for c in df_fonte.columns if df_fonte[c].notna().any()]
-    df_fonte = df_fonte[colunas_com_dado]
-
-    col_valor = _achar_coluna(df_fonte, info["candidatos_col"])
-    col_data = _achar_coluna(df_fonte, _CANDIDATOS_COL_DATA)
-    if col_valor is None or col_data is None:
-        return []
-
-    df = df_fonte[[col_data, col_valor]].copy()
-    df.columns = ["data", "valor"]
-
-    col_hora = encontrar_coluna(df_fonte.columns, "HORA") or encontrar_coluna(df_fonte.columns, "HR", "MEDICAO")
-    if col_hora is not None and col_hora != col_data and "HORA" not in str(col_data).upper():
-        df["data"] = df["data"].astype(str) + " " + df_fonte[col_hora].astype(str)
-
-    df["data"] = df["data"].astype(str).str.strip('"')
-    df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-    df = df.dropna(subset=["valor"])
-    if df.empty:
-        return []
-
-    return df.sort_values("data").tail(limite_pontos).to_dict("records")
-
-
-def calcular_estatisticas(serie, unidade=""):
-    if not serie:
-        return None
-    valores = [p["valor"] for p in serie]
-    media = sum(valores) / len(valores)
-
-    if len(valores) >= 6:
-        terco = max(1, len(valores) // 3)
-        diferenca = sum(valores[-terco:]) / terco - sum(valores[:terco]) / terco
-        limiar = max(0.5, abs(media) * 0.03)
-        if diferenca > limiar:
-            tendencia = f"📈 Subindo (+{diferenca:.1f}{unidade})"
-        elif diferenca < -limiar:
-            tendencia = f"📉 Descendo ({diferenca:.1f}{unidade})"
-        else:
-            tendencia = "➡️ Estável"
-    else:
-        tendencia = "— (poucos pontos)"
-
-    return {
-        "media": round(media, 1),
-        "minima": round(min(valores), 1),
-        "maxima": round(max(valores), 1),
-        "tendencia": tendencia,
-        "n_pontos": len(valores),
-    }
-
-# ==========================================================
-# ESTADO E TABELA UNIFICADA
-# ==========================================================
-
-tabela = pd.DataFrame()
-tabela_lock = threading.Lock()
+tabela             = pd.DataFrame()
+tabela_lock        = threading.Lock()
 ultima_atualizacao = None
 _ultimo_bloco_inmet = pd.DataFrame()
 
+# ==========================================================
+# DIAGNÓSTICO — registra o resultado de cada coleta, fonte a fonte
+# ==========================================================
+# Serve pra gerar a aba "Diagnóstico" no Sheets, que muda a cada ciclo
+# (tem timestamp), então é uma forma visual de confirmar que o app está
+# rodando de verdade, sem precisar abrir logs do Render.
 
-def montar_tabela():
+_diagnostico_lock = threading.Lock()
+_diagnostico = {}  # fonte -> {"ok": bool, "registros": int, "detalhe": str, "hora": datetime}
+
+def _marcar_diagnostico(fonte, ok, registros=0, detalhe=""):
+    with _diagnostico_lock:
+        _diagnostico[fonte] = {
+            "ok": ok,
+            "registros": registros,
+            "detalhe": detalhe,
+            "hora": datetime.now(),
+        }
+
+def montar_aba_diagnostico():
+    """Monta um DataFrame simples pra aba 'Diagnóstico' do Sheets."""
+    agora = datetime.now()
+    linhas = [{
+        "Fonte": "── ÚLTIMA EXECUÇÃO DO CICLO ──",
+        "Status": "🟢 RODANDO",
+        "Registros": "",
+        "Detalhe": f"Ciclo iniciado às {agora.strftime('%d/%m/%Y %H:%M:%S')}",
+        "Checado em": agora.strftime("%d/%m/%Y %H:%M:%S"),
+    }]
+    with _diagnostico_lock:
+        for fonte, info in sorted(_diagnostico.items()):
+            linhas.append({
+                "Fonte": fonte,
+                "Status": "✅ OK" if info["ok"] else "❌ FALHOU",
+                "Registros": info["registros"],
+                "Detalhe": info["detalhe"],
+                "Checado em": info["hora"].strftime("%d/%m/%Y %H:%M:%S"),
+            })
+    return pd.DataFrame(linhas)
+
+# ==========================================================
+# MONTAR TABELA UNIFICADA
+# ==========================================================
+
+def montar_tabela(forcar_inmet=False):
+    """
+    forcar_inmet: repassado para o caminho de reserva (ZIP anual), caso a
+    API de tempo real esteja indisponível — ignora o cache de hash e força
+    reprocessar o ZIP. Não tem efeito quando a API de tempo real responde
+    normalmente (que é o caso mais comum).
+    """
     global _ultimo_bloco_inmet
 
-    df_hora = coletar_om_horario()
-    df_prev = coletar_om_diario()
-    df_estacao = coletar_estacao_meteorologica()
+    df_hora       = coletar_om_horario()
+    df_prev       = coletar_om_diario()
+    df_estacao    = coletar_estacao_meteorologica()
     df_comunidade = coletar_dados_comunidade()
 
-    df_inmet_novo = coletar_inmet()
-    if not df_inmet_novo.empty:
+    # A API de tempo real do INMET traz dado hora a hora, então é checada
+    # a cada ciclo — igual o Open-Meteo. Se ela falhar, coletar_inmet()
+    # cai sozinha para o ZIP anual como reserva (esse sim mais raro de
+    # mudar, mas ainda assim comparado por hash pra não reprocessar à toa).
+    df_inmet_novo, inmet_mudou = coletar_inmet(forcar=forcar_inmet)
+    if inmet_mudou and not df_inmet_novo.empty:
         _ultimo_bloco_inmet = df_inmet_novo
-        _marcar_diagnostico("INMET (fonte usada)", True, len(df_inmet_novo), "API de tempo real")
     else:
-        _marcar_diagnostico("INMET (fonte usada)", False, 0, "API sem dados; mantendo último bloco")
+        log.info("INMET: usando o último bloco de dados válido dessa fonte (nenhuma novidade neste ciclo).")
 
-    partes = [d for d in [df_hora, df_prev, df_estacao, df_comunidade, _ultimo_bloco_inmet] if not d.empty]
+    df_inmet = _ultimo_bloco_inmet
+
+    partes = [df for df in [df_hora, df_prev, df_estacao, df_comunidade, df_inmet] if not df.empty]
     if not partes:
         return pd.DataFrame()
 
-    montada = pd.concat(partes, ignore_index=True)
-    cols = ["Estacao"] + [c for c in montada.columns if c != "Estacao"]
-    return montada[cols]
+    tabela_montada = pd.concat(partes, ignore_index=True)
+    cols = ["Estacao"] + [c for c in tabela_montada.columns if c != "Estacao"]
+    return tabela_montada[cols]
 
 # ==========================================================
 # GOOGLE SHEETS
@@ -596,20 +778,19 @@ def montar_tabela():
 
 _hash_abas_enviadas = {}
 
-
 def _hash_dataframe(df):
     return pd.util.hash_pandas_object(df.fillna("—").astype(str)).sum()
-
 
 def _escrever_aba_com_retry(sh, nome_aba, dados, tentativas=3, pular_dedup=False):
     import gspread
 
     novo_hash = _hash_dataframe(dados)
     if not pular_dedup and _hash_abas_enviadas.get(nome_aba) == novo_hash:
+        log.info(f"Aba '{nome_aba}' sem mudanças; pulando escrita no Sheets.")
         return
 
     dados_str = dados.fillna("—").astype(str)
-    linhas = [dados_str.columns.tolist()] + dados_str.values.tolist()
+    linhas    = [dados_str.columns.tolist()] + dados_str.values.tolist()
 
     for tentativa in range(1, tentativas + 1):
         try:
@@ -623,39 +804,64 @@ def _escrever_aba_com_retry(sh, nome_aba, dados, tentativas=3, pular_dedup=False
             return
         except gspread.exceptions.APIError as e:
             espera = 5 * tentativa
-            log.warning(f"Erro do Sheets na aba '{nome_aba}' (tentativa {tentativa}); aguardando {espera}s... ({e})")
+            log.warning(f"Rate limit/erro do Sheets na aba '{nome_aba}' (tentativa {tentativa}/{tentativas}); "
+                        f"aguardando {espera}s... ({e})")
             time.sleep(espera)
         except Exception as e:
-            log.error(f"Erro ao escrever aba '{nome_aba}': {e}")
+            log.error(f"Erro inesperado ao escrever aba '{nome_aba}': {e}")
             return
     log.error(f"Falha ao escrever aba '{nome_aba}' após {tentativas} tentativas.")
 
-# ── Aba "Gráficos" ─────────────────────────────────────────
+# ==========================================================
+# ABA "GRÁFICOS" — temperatura do dia e da semana (Open-Meteo)
+# ==========================================================
+#
+# Cria/atualiza uma aba "Gráficos" com dois blocos de dados NUMÉRICOS
+# vindos do Open-Meteo:
+#     A:B  -> temperatura hora a hora de hoje
+#     D:F  -> máxima e mínima dos próximos 7 dias
+# Na primeira execução, insere dois gráficos de linha nativos do Google
+# Sheets apontando para esses blocos. Nos ciclos seguintes só reescreve
+# os números — os gráficos já existentes se atualizam sozinhos.
+#
+# Os dados são gravados aqui por uma função própria (e não por
+# _escrever_aba_com_retry) porque aquela converte tudo em texto, e o
+# Sheets não plota texto: gráfico precisa de número de verdade.
+#
+# As faixas usadas pelos gráficos vão até a linha 200 de propósito —
+# sobra espaço se um dia forem mais horas/dias, e célula vazia
+# simplesmente não é plotada.
 
 ABA_GRAFICOS = "Gráficos"
 _GRAF_LINHAS_MAX = 200
 
-
 def _dados_graficos(df):
+    """Extrai da tabela unificada os dois blocos numéricos do Open-Meteo."""
     linhas_hora, linhas_dia = [], []
     if df.empty or "Estacao" not in df.columns:
         return linhas_hora, linhas_dia
 
+    # ── Temperatura hora a hora (hoje) ──
     df_h = df[df["Estacao"] == "Open-Meteo – Hoje (horário)"].copy()
     if not df_h.empty and "Temperatura (°C)" in df_h.columns:
         df_h["_temp"] = pd.to_numeric(df_h["Temperatura (°C)"], errors="coerce")
         df_h = df_h.dropna(subset=["_temp"]).sort_values("Hora")
-        linhas_hora = [[str(r["Hora"])[:5], float(r["_temp"])] for _, r in df_h.iterrows()]
+        linhas_hora = [
+            [str(r["Hora"])[:5], float(r["_temp"])] for _, r in df_h.iterrows()
+        ]
 
+    # ── Máxima e mínima da semana (próximos 7 dias) ──
     df_d = df[df["Estacao"] == "Open-Meteo – Previsão (diária)"].copy()
     if not df_d.empty and "Temp. Máx (°C)" in df_d.columns:
         df_d["_max"] = pd.to_numeric(df_d["Temp. Máx (°C)"], errors="coerce")
         df_d["_min"] = pd.to_numeric(df_d["Temp. Mín (°C)"], errors="coerce")
         df_d = df_d.dropna(subset=["_max", "_min"]).sort_values("Data").head(7)
-        linhas_dia = [[str(r["Data"]), float(r["_max"]), float(r["_min"])] for _, r in df_d.iterrows()]
+        linhas_dia = [
+            [str(r["Data"]), float(r["_max"]), float(r["_min"])]
+            for _, r in df_d.iterrows()
+        ]
 
     return linhas_hora, linhas_dia
-
 
 def _faixa_grafico(sheet_id, col_ini, col_fim):
     return {
@@ -666,9 +872,9 @@ def _faixa_grafico(sheet_id, col_ini, col_fim):
         "endColumnIndex": col_fim,
     }
 
-
 def _spec_grafico_linha(sheet_id, titulo, titulo_x, col_dominio, colunas_series,
                         linha_ancora, coluna_ancora):
+    """Monta a requisição addChart de um gráfico de linha."""
     return {
         "addChart": {
             "chart": {
@@ -711,12 +917,17 @@ def _spec_grafico_linha(sheet_id, titulo, titulo_x, col_dominio, colunas_series,
         }
     }
 
-
 def _atualizar_aba_graficos(sh, df):
+    """
+    Reescreve os dados da aba "Gráficos" e, se ainda não houver gráficos
+    nela, cria os dois gráficos de linha. Falhas aqui não derrubam o
+    restante da exportação.
+    """
     import gspread
 
     linhas_hora, linhas_dia = _dados_graficos(df)
     if not linhas_hora and not linhas_dia:
+        log.info("Sem dados do Open-Meteo neste ciclo; aba de gráficos não foi atualizada.")
         return
 
     try:
@@ -725,15 +936,23 @@ def _atualizar_aba_graficos(sh, df):
         except gspread.exceptions.WorksheetNotFound:
             ws = sh.add_worksheet(title=ABA_GRAFICOS, rows=_GRAF_LINHAS_MAX, cols=20)
 
+        # Limpa só as colunas de dados (A:F), preservando os gráficos.
         ws.batch_clear([f"A1:F{_GRAF_LINHAS_MAX}"])
 
         if linhas_hora:
-            ws.update(values=[["Hora", "Temperatura (°C)"]] + linhas_hora,
-                      range_name="A1", value_input_option="USER_ENTERED")
+            ws.update(
+                values=[["Hora", "Temperatura (°C)"]] + linhas_hora,
+                range_name="A1",
+                value_input_option="USER_ENTERED",
+            )
         if linhas_dia:
-            ws.update(values=[["Data", "Temp. Máx (°C)", "Temp. Mín (°C)"]] + linhas_dia,
-                      range_name="D1", value_input_option="USER_ENTERED")
+            ws.update(
+                values=[["Data", "Temp. Máx (°C)", "Temp. Mín (°C)"]] + linhas_dia,
+                range_name="D1",
+                value_input_option="USER_ENTERED",
+            )
 
+        # Os gráficos são criados uma única vez; depois só os números mudam.
         metadados = sh.fetch_sheet_metadata(
             params={"fields": "sheets(properties(sheetId,title),charts(chartId))"}
         )
@@ -741,12 +960,13 @@ def _atualizar_aba_graficos(sh, df):
             aba.get("properties", {}).get("title") == ABA_GRAFICOS and aba.get("charts")
             for aba in metadados.get("sheets", [])
         )
-        total = len(linhas_hora) + len(linhas_dia)
         if ja_tem_grafico:
-            _marcar_diagnostico("Gráficos (aba)", True, total, "dados reescritos")
+            log.info("Aba 'Gráficos' atualizada (gráficos já existentes).")
+            _marcar_diagnostico("Gráficos (aba)", True, len(linhas_hora) + len(linhas_dia),
+                                "dados reescritos")
             return
 
-        sh.batch_update({"requests": [
+        requisicoes = [
             _spec_grafico_linha(
                 ws.id, "Variação da temperatura hoje (hora a hora) — Open-Meteo",
                 "Hora", col_dominio=0, colunas_series=[1],
@@ -757,36 +977,43 @@ def _atualizar_aba_graficos(sh, df):
                 "Data", col_dominio=3, colunas_series=[4, 5],
                 linha_ancora=19, coluna_ancora=7,
             ),
-        ]})
-        _marcar_diagnostico("Gráficos (aba)", True, total, "gráficos criados")
+        ]
+        sh.batch_update({"requests": requisicoes})
+        log.info("Gráficos de temperatura criados na aba 'Gráficos'.")
+        _marcar_diagnostico("Gráficos (aba)", True, len(linhas_hora) + len(linhas_dia),
+                            "gráficos criados")
 
     except Exception as e:
         log.error(f"Erro ao montar a aba de gráficos: {e}")
         _marcar_diagnostico("Gráficos (aba)", False, 0, str(e))
 
-
 def exportar_para_sheets(df):
     try:
-        import gspread  # noqa: F401
+        import gspread  # noqa: F401 (garante que a lib está instalada)
     except ImportError:
         log.warning("gspread/google-auth não instalados. Verifique o requirements.txt.")
         return
 
     if not os.path.exists(GSHEETS_CREDENCIAIS):
-        log.warning(f"Credenciais não encontradas em {GSHEETS_CREDENCIAIS}.")
+        log.warning(f"Credenciais não encontradas em {GSHEETS_CREDENCIAIS}. Configure o Secret File no Render.")
         return
 
     try:
         gc = _obter_cliente_gspread()
         sh = gc.open(GSHEETS_NOME)
 
+        # A aba Diagnóstico é escrita SEMPRE, mesmo se a tabela principal
+        # estiver vazia — é ela que prova visualmente que o ciclo rodou,
+        # porque tem um timestamp que muda a cada execução.
         _escrever_aba_com_retry(sh, "Diagnóstico", montar_aba_diagnostico(), pular_dedup=True)
 
         if df.empty:
-            log.warning("Tabela principal vazia; só a aba Diagnóstico foi atualizada.")
+            log.warning("Tabela principal vazia; só a aba Diagnóstico foi atualizada neste ciclo.")
             return
 
         _escrever_aba_com_retry(sh, "Todas", df)
+
+        # Aba com os gráficos de temperatura (dia e semana, Open-Meteo).
         _atualizar_aba_graficos(sh, df)
 
         for fonte in df["Estacao"].unique():
@@ -799,68 +1026,51 @@ def exportar_para_sheets(df):
         log.error(f"Erro ao exportar para Google Sheets: {e}")
 
 # ==========================================================
-# ATUALIZAÇÃO E AGENDADOR
+# ATUALIZAÇÃO DE DADOS
 # ==========================================================
 
-_ciclo_lock = threading.Lock()
-
-
-def atualizar_dados():
+def atualizar_dados(forcar_inmet=False):
     global tabela, ultima_atualizacao
-    # evita dois ciclos ao mesmo tempo (ex.: envio de CSV durante o agendado)
-    if not _ciclo_lock.acquire(blocking=False):
-        log.info("Já existe um ciclo em andamento; ignorando este.")
-        return
-    try:
-        log.info("Iniciando ciclo de atualização...")
-        nova = montar_tabela()
+    log.info("Iniciando ciclo de atualização dos dados...")
+    nova_tabela = montar_tabela(forcar_inmet=forcar_inmet)
+    with tabela_lock:
+        if not nova_tabela.empty:
+            tabela = nova_tabela
+            ultima_atualizacao = datetime.now()
+            log.info(f"Atualização concluída: {len(tabela)} registros.")
+        else:
+            log.warning("A atualização não trouxe dados novos; mantendo a tabela anterior.")
+
+    if GSHEETS_ATIVO:
         with tabela_lock:
-            if not nova.empty:
-                tabela = nova
-                ultima_atualizacao = datetime.now()
-                log.info(f"Atualização concluída: {len(tabela)} registros.")
-            else:
-                log.warning("Sem dados novos; mantendo a tabela anterior.")
+            df_copia = tabela.copy()
+        exportar_para_sheets(df_copia)
 
-        if GSHEETS_ATIVO:
-            with tabela_lock:
-                df_copia = tabela.copy()
-            exportar_para_sheets(df_copia)
-    finally:
-        _ciclo_lock.release()
-
+# ==========================================================
+# AGENDADOR
+# ==========================================================
 
 def proxima_execucao():
-    base = datetime.now().replace(minute=0, second=0, microsecond=0)
+    agora = datetime.now()
+    base  = agora.replace(minute=0, second=0, microsecond=0)
     return base + timedelta(hours=INTERVALO_ATUALIZACAO_HORAS)
-
 
 def agendador():
     while True:
-        alvo = proxima_execucao()
+        alvo     = proxima_execucao()
         segundos = (alvo - datetime.now()).total_seconds()
-        log.info(f"Próxima atualização: {alvo.strftime('%d/%m/%Y às %H:%M')}")
+        log.info(f"Próxima atualização automática agendada para {alvo.strftime('%d/%m/%Y às %H:%M')}")
         time.sleep(max(segundos, 1))
         try:
             atualizar_dados()
         except Exception as e:
-            log.error(f"Erro inesperado no ciclo: {e}")
+            log.error(f"Erro inesperado no ciclo de atualização: {e}")
 
 # ==========================================================
 # FLASK
 # ==========================================================
 
 app = Flask(__name__)
-
-
-def gerar_linhas(df):
-    linhas = []
-    for _, row in df.iterrows():
-        css = FONTE_CSS.get(row.get("Estacao", ""), "")
-        celulas = "".join(f"<td>{html.escape(str(v))}</td>" for v in row.values)
-        linhas.append(f'<tr class="{css}">{celulas}</tr>')
-    return "\n".join(linhas)
-
 
 @app.route("/")
 def inicio():
@@ -870,9 +1080,11 @@ def inicio():
     if df_atual.empty:
         return "<h1>Buscando os dados pela primeira vez... atualize a página em alguns segundos.</h1>"
 
-    fontes = list(df_atual["Estacao"].unique())
+    fontes      = list(df_atual["Estacao"].unique())
     fonte_ativa = flask_request.args.get("fonte", "todas")
-    df_exibir = df_atual if fonte_ativa == "todas" else df_atual[df_atual["Estacao"] == fonte_ativa]
+
+    df_exibir = df_atual if fonte_ativa == "todas" else \
+                df_atual[df_atual["Estacao"] == fonte_ativa]
 
     if fonte_ativa == "todas":
         colunas_mostrar = list(df_atual.columns)
@@ -881,105 +1093,182 @@ def inicio():
         if "Estacao" not in colunas_mostrar:
             colunas_mostrar = ["Estacao"] + colunas_mostrar
 
-    cabecalho_html = "".join(f"<th>{html.escape(str(c))}</th>" for c in colunas_mostrar)
-    linhas_html = gerar_linhas(df_exibir[colunas_mostrar].fillna("—").head(500))
+    cabecalho_html = "".join(f"<th>{col}</th>" for col in colunas_mostrar)
+    linhas_html    = gerar_linhas(df_exibir[colunas_mostrar].fillna("—").head(500))
 
-    ativo_todas = "btn-ativo" if fonte_ativa == "todas" else ""
-    botoes = f'<a href="/" class="btn btn-todas {ativo_todas}">🌐 Todas</a>\n'
+    botoes = f'<a href="/" class="btn btn-todas {"btn-ativo" if fonte_ativa=="todas" else ""}">🌐 Todas</a>\n'
+    icones = {
+        "Open-Meteo – Hoje (horário)":      "🕐",
+        "Open-Meteo – Previsão (diária)":   "📅",
+        "Estação Meteorológica":            "🌡️",
+        "Dados da Comunidade":              "🙋",
+        "INMET - Cachoeira do Sul":         "📡",
+        "INMET - Santa Maria Automática":   "📡",
+        "INMET - Santa Maria Convencional": "📡",
+    }
     for fonte in fontes:
-        css = FONTE_CSS.get(fonte, "")
+        css   = FONTE_CSS.get(fonte, "")
         ativo = "btn-ativo" if fonte == fonte_ativa else ""
-        ico = ICONES.get(fonte, "")
-        url = f"/?fonte={requests.utils.quote(fonte)}"
-        botoes += f'<a href="{url}" class="btn {css} {ativo}">{ico} {html.escape(fonte)}</a>\n'
+        ico   = icones.get(fonte, "")
+        url   = f"/?fonte={requests.utils.quote(fonte)}"
+        botoes += f'<a href="{url}" class="btn {css} {ativo}">{ico} {fonte}</a>\n'
 
-    total = len(df_atual)
+    total   = len(df_atual)
     exibido = min(500, len(df_exibir))
-    rodape = ultima_atualizacao.strftime("%d/%m/%Y às %H:%M:%S") if ultima_atualizacao else "—"
+    rodape_atualizacao = (
+        ultima_atualizacao.strftime("%d/%m/%Y às %H:%M:%S")
+        if ultima_atualizacao else "—"
+    )
 
     banner_sheets = ""
     if GSHEETS_ATIVO:
         banner_sheets = f"""
-<div class="banner-gs">
-📊 Dados sincronizados com o Google Sheets:&nbsp;
-<a href="{GSHEETS_LINK}" target="_blank"><strong>Abrir planilha →</strong></a>
-&nbsp;|&nbsp; veja os gráficos de temperatura na aba <strong>Gráficos</strong>.
-</div>"""
+        <div class="banner-gs">
+            📊 Dados sincronizados com o Google Sheets:&nbsp;
+            <a href="{GSHEETS_LINK}" target="_blank"><strong>Abrir planilha →</strong></a>
+            &nbsp;|&nbsp; veja os gráficos de temperatura na aba <strong>Gráficos</strong>.
+        </div>"""
 
     banner_comunidade = """
-<div class="banner-add">
-🙋 Tem dados meteorológicos próprios? &nbsp;
-<a href="/adicionar"><strong>Envie um CSV com seus dados →</strong></a>
-</div>"""
+    <div class="banner-add">
+        🙋 Tem dados meteorológicos próprios? &nbsp;
+        <a href="/adicionar"><strong>Envie um CSV com seus dados →</strong></a>
+    </div>"""
 
     return f"""<!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>Clima Unificado</title>
-<style>
-body {{ font-family: Arial, sans-serif; margin: 20px; background: #f0f2f5; }}
-h1 {{ color: #1565C0; margin-bottom: 4px; }}
-p {{ margin: 4px 0 14px; color: #555; font-size: 13px; }}
-.banner-gs {{ background: #E8F5E9; border: 1px solid #A5D6A7; border-radius: 8px; padding: 10px 16px; margin-bottom: 14px; font-size: 13px; color: #1B5E20; }}
-.banner-gs a {{ color: #1B5E20; }}
-.banner-add {{ background: #EDE7F6; border: 1px solid #B39DDB; border-radius: 8px; padding: 10px 16px; margin-bottom: 14px; font-size: 13px; color: #4527A0; }}
-.banner-add a {{ color: #4527A0; }}
-.filtros {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }}
-.btn {{ padding: 7px 16px; border-radius: 20px; font-size: 13px; font-weight: bold; text-decoration: none; border: 2px solid transparent; cursor: pointer; }}
-.btn:hover {{ opacity: .8; }}
-.btn-ativo {{ border-color: #222 !important; }}
-.btn-todas {{ background: #e0e0e0; color: #333; }}
-.src-om-hora {{ background: #B3E5FC; color: #01579B; }}
-.src-om-prev {{ background: #C5CAE9; color: #1A237E; }}
-.src-estacao-meteo {{ background: #FFE0B2; color: #E65100; }}
-.src-cachoeira {{ background: #C8E6C9; color: #1B5E20; }}
-.src-sm-auto {{ background: #FFF9C4; color: #E65100; }}
-.src-sm-conv {{ background: #F8BBD0; color: #880E4F; }}
-.src-comunidade {{ background: #D1C4E9; color: #4527A0; }}
-.wrapper {{ overflow-x: auto; }}
-table {{ border-collapse: collapse; width: 100%; font-size: 12px; background: white; min-width: 900px; }}
-thead th {{ background: #1565C0; color: white; padding: 8px 6px; position: sticky; top: 0; white-space: nowrap; }}
-td {{ border: 1px solid #ddd; padding: 5px 6px; text-align: center; white-space: nowrap; }}
-tr.src-om-hora td {{ background: #E1F5FE; }}
-tr.src-om-prev td {{ background: #E8EAF6; }}
-tr.src-estacao-meteo td {{ background: #FFF3E0; }}
-tr.src-cachoeira td {{ background: #E8F5E9; }}
-tr.src-sm-auto td {{ background: #FFFDE7; }}
-tr.src-sm-conv td {{ background: #FCE4EC; }}
-tr.src-comunidade td {{ background: #EDE7F6; }}
-</style>
+    <meta charset="UTF-8">
+    <title>Clima Unificado</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f0f2f5; }}
+        h1   {{ color: #1565C0; margin-bottom: 4px; }}
+        p    {{ margin: 4px 0 14px; color: #555; font-size: 13px; }}
+
+        .banner-gs {{
+            background: #E8F5E9; border: 1px solid #A5D6A7;
+            border-radius: 8px; padding: 10px 16px; margin-bottom: 14px;
+            font-size: 13px; color: #1B5E20;
+        }}
+        .banner-gs a {{ color: #1B5E20; }}
+
+        .banner-add {{
+            background: #EDE7F6; border: 1px solid #B39DDB;
+            border-radius: 8px; padding: 10px 16px; margin-bottom: 14px;
+            font-size: 13px; color: #4527A0;
+        }}
+        .banner-add a {{ color: #4527A0; }}
+
+        .filtros {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }}
+        .btn {{
+            padding: 7px 16px; border-radius: 20px; font-size: 13px;
+            font-weight: bold; text-decoration: none; border: 2px solid transparent;
+            cursor: pointer; transition: opacity .15s, border-color .15s;
+        }}
+        .btn:hover  {{ opacity: .8; }}
+        .btn-ativo  {{ border-color: #222 !important; }}
+        .btn-todas  {{ background: #e0e0e0; color: #333; }}
+
+        .src-om-hora        {{ background: #B3E5FC; color: #01579B; }}
+        .src-om-prev        {{ background: #C5CAE9; color: #1A237E; }}
+        .src-estacao-meteo  {{ background: #FFE0B2; color: #E65100; }}
+        .src-cachoeira      {{ background: #C8E6C9; color: #1B5E20; }}
+        .src-sm-auto        {{ background: #FFF9C4; color: #E65100; }}
+        .src-sm-conv        {{ background: #F8BBD0; color: #880E4F; }}
+        .src-comunidade     {{ background: #D1C4E9; color: #4527A0; }}
+
+        .wrapper {{ overflow-x: auto; }}
+        table    {{ border-collapse: collapse; width: 100%; font-size: 12px; background: white; min-width: 900px; }}
+        thead th {{
+            background: #1565C0; color: white; padding: 8px 6px;
+            position: sticky; top: 0; white-space: nowrap;
+        }}
+        td {{ border: 1px solid #ddd; padding: 5px 6px; text-align: center; white-space: nowrap; }}
+
+        tr.src-om-hora       td {{ background: #E1F5FE; }}
+        tr.src-om-prev       td {{ background: #E8EAF6; }}
+        tr.src-estacao-meteo td {{ background: #FFF3E0; }}
+        tr.src-cachoeira     td {{ background: #E8F5E9; }}
+        tr.src-sm-auto       td {{ background: #FFFDE7; }}
+        tr.src-sm-conv       td {{ background: #FCE4EC; }}
+        tr.src-comunidade    td {{ background: #EDE7F6; }}
+    </style>
 </head>
 <body>
-<h1>🌦️ Clima Unificado – INMET + Open-Meteo</h1>
-<p>Total de registros: <strong>{total}</strong> &nbsp;|&nbsp;
-Exibindo: <strong>{exibido}</strong> &nbsp;|&nbsp;
-Fonte: <strong>{html.escape(fonte_ativa)}</strong> &nbsp;|&nbsp;
-Última atualização: <strong>{rodape}</strong>
-&nbsp;|&nbsp; <a href="/graficos" style="color:#1565C0; font-weight:bold;">📊 Gráficos e tendências →</a></p>
-{banner_sheets}
-{banner_comunidade}
-<div class="filtros">
-{botoes}
-</div>
-<div class="wrapper">
-<table>
-<thead><tr>{cabecalho_html}</tr></thead>
-<tbody>{linhas_html}</tbody>
-</table>
-</div>
+    <h1>🌦️ Clima Unificado – INMET + Open-Meteo</h1>
+    <p>Total de registros: <strong>{total}</strong> &nbsp;|&nbsp;
+       Exibindo: <strong>{exibido}</strong> &nbsp;|&nbsp;
+       Fonte: <strong>{fonte_ativa}</strong> &nbsp;|&nbsp;
+       Última atualização: <strong>{rodape_atualizacao}</strong></p>
+
+    {banner_sheets}
+    {banner_comunidade}
+
+    <div class="filtros">
+        {botoes}
+    </div>
+
+    <div class="wrapper">
+        <table>
+            <thead><tr>{cabecalho_html}</tr></thead>
+            <tbody>{linhas_html}</tbody>
+        </table>
+    </div>
 </body>
 </html>"""
 
+def _data_mais_recente_por_fonte(df):
+    """
+    Para cada fonte na tabela, tenta achar a data/hora mais recente presente
+    nos dados. Reconhece tanto os nomes de coluna do ZIP histórico
+    ('Data', 'Hora') quanto os da API de tempo real do INMET
+    ('DT_MEDICAO', 'HR_MEDICAO'). Usado só para diagnóstico no /status —
+    não afeta a lógica de coleta/atualização.
+    """
+    resultado = {}
+    if df.empty:
+        return resultado
+
+    for fonte in df["Estacao"].unique():
+        df_f = df[df["Estacao"] == fonte]
+        col_data = encontrar_coluna(df_f.columns, "DATA") or encontrar_coluna(df_f.columns, "DT", "MEDICAO")
+        if col_data is None:
+            resultado[fonte] = "coluna de data não encontrada"
+            continue
+        try:
+            valores_data = df_f[col_data].astype(str)
+            col_hora = encontrar_coluna(df_f.columns, "HORA") or encontrar_coluna(df_f.columns, "HR", "MEDICAO")
+            if col_hora is not None:
+                valores = (valores_data + " " + df_f[col_hora].astype(str)).tolist()
+            else:
+                valores = valores_data.tolist()
+            resultado[fonte] = max(valores) if valores else "sem dados"
+        except Exception as e:
+            resultado[fonte] = f"erro ao calcular: {e}"
+    return resultado
 
 @app.route("/adicionar", methods=["GET", "POST"])
 def adicionar_dado():
-    erro = None
+    """
+    Formulário público: qualquer pessoa com acesso ao site pode enviar
+    seus próprios dados meteorológicos enviando um arquivo CSV (ex.:
+    exportado de uma planilha, estação caseira, pluviômetro). QUALQUER
+    CSV é aceito, com qualquer conjunto de colunas — não há mais um
+    formato fixo obrigatório (ver _processar_csv_comunidade). As linhas
+    válidas são gravadas na aba "Dados da Comunidade" e entram na tabela
+    unificada (coletar_dados_comunidade), junto com as demais fontes.
+
+    ATENÇÃO: não há login nem validação de veracidade — qualquer um pode
+    enviar qualquer valor. Os dados aparecem claramente identificados como
+    "Dados da Comunidade" (não misturados com INMET/Open-Meteo) para deixar
+    claro que são autodeclarados.
+    """
+    erro        = None
     sucesso_qtd = None
-    ignoradas = 0
+    ignoradas   = 0
 
     if flask_request.method == "POST":
-        nome = flask_request.form.get("nome", "").strip()
+        nome    = flask_request.form.get("nome", "").strip()
         arquivo = flask_request.files.get("arquivo")
 
         if not arquivo or arquivo.filename == "":
@@ -988,13 +1277,16 @@ def adicionar_dado():
             erro = "O arquivo precisa ser um .csv."
         else:
             try:
-                conteudo = arquivo.read(2_000_000)  # limite de ~2 MB
+                conteudo = arquivo.read()
                 linhas, total, ignoradas = _processar_csv_comunidade(conteudo, nome)
                 if not linhas:
-                    erro = "Nenhuma linha com dados foi encontrada nesse CSV."
+                    erro = ("Nenhuma linha com dados foi encontrada nesse CSV — parece estar "
+                            "vazio ou só com linhas em branco.")
                 else:
                     _salvar_dados_comunidade(linhas)
                     sucesso_qtd = len(linhas)
+                    # atualiza a tabela em segundo plano pra já refletir os
+                    # novos dados sem esperar o próximo ciclo agendado
                     threading.Thread(target=atualizar_dados, daemon=True).start()
             except Exception as e:
                 log.error(f"Erro ao processar CSV da comunidade: {e}")
@@ -1003,63 +1295,87 @@ def adicionar_dado():
     mensagem_html = ""
     if sucesso_qtd is not None:
         extra = f" ({ignoradas} linha(s) ignorada(s) por estarem vazias)" if ignoradas else ""
-        mensagem_html = (f'<div class="msg msg-ok">✅ {sucesso_qtd} registro(s) enviado(s){extra}! '
-                         f'Pode levar alguns segundos para aparecer na tabela.</div>')
+        mensagem_html = (
+            f'<div class="msg msg-ok">✅ {sucesso_qtd} registro(s) enviado(s){extra}! '
+            f'Pode levar alguns segundos para aparecer na tabela.</div>'
+        )
     elif erro:
-        mensagem_html = f'<div class="msg msg-erro">⚠️ {html.escape(erro)}</div>'
+        mensagem_html = f'<div class="msg msg-erro">⚠️ {erro}</div>'
 
     colunas_modelo = "".join(f"<li>{c}</li>" for c in CAMPOS_COMUNIDADE)
 
     return f"""<!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>Adicionar dados — Clima Unificado</title>
-<style>
-body {{ font-family: Arial, sans-serif; margin: 20px; background: #f0f2f5; }}
-h1 {{ color: #4527A0; margin-bottom: 4px; }}
-p.info {{ color: #555; font-size: 13px; margin-bottom: 20px; }}
-a.voltar {{ font-size: 13px; color: #1565C0; text-decoration: none; }}
-form {{ background: white; border-radius: 10px; padding: 20px 24px; max-width: 460px; box-shadow: 0 1px 4px rgba(0,0,0,.1); }}
-label {{ display: block; font-size: 13px; font-weight: bold; color: #333; margin: 12px 0 4px; }}
-input[type="text"], input[type="file"] {{ width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; box-sizing: border-box; background: white; }}
-button {{ margin-top: 18px; background: #4527A0; color: white; border: none; padding: 10px 22px; border-radius: 20px; font-size: 14px; font-weight: bold; cursor: pointer; }}
-button:hover {{ opacity: .85; }}
-.msg {{ padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; max-width: 460px; }}
-.msg-ok {{ background: #E8F5E9; border: 1px solid #A5D6A7; color: #1B5E20; }}
-.msg-erro {{ background: #FFEBEE; border: 1px solid #EF9A9A; color: #B71C1C; }}
-.modelo {{ background: #F3E5F5; border: 1px solid #CE93D8; border-radius: 8px; padding: 12px 16px; max-width: 460px; font-size: 12px; color: #4A148C; margin-top: 18px; }}
-.modelo ul {{ margin: 6px 0 8px 18px; padding: 0; }}
-.modelo a {{ color: #4527A0; font-weight: bold; }}
-</style>
+    <meta charset="UTF-8">
+    <title>Adicionar dados — Clima Unificado</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f0f2f5; }}
+        h1   {{ color: #4527A0; margin-bottom: 4px; }}
+        p.info {{ color: #555; font-size: 13px; margin-bottom: 20px; }}
+        a.voltar {{ font-size: 13px; color: #1565C0; text-decoration: none; }}
+        form {{
+            background: white; border-radius: 10px; padding: 20px 24px;
+            max-width: 460px; box-shadow: 0 1px 4px rgba(0,0,0,.1);
+        }}
+        label {{ display: block; font-size: 13px; font-weight: bold; color: #333; margin: 12px 0 4px; }}
+        input[type="text"], input[type="file"] {{
+            width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px;
+            font-size: 14px; box-sizing: border-box; background: white;
+        }}
+        button {{
+            margin-top: 18px; background: #4527A0; color: white; border: none;
+            padding: 10px 22px; border-radius: 20px; font-size: 14px; font-weight: bold;
+            cursor: pointer;
+        }}
+        button:hover {{ opacity: .85; }}
+        .msg {{ padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; max-width: 460px; }}
+        .msg-ok    {{ background: #E8F5E9; border: 1px solid #A5D6A7; color: #1B5E20; }}
+        .msg-erro  {{ background: #FFEBEE; border: 1px solid #EF9A9A; color: #B71C1C; }}
+        .modelo {{
+            background: #F3E5F5; border: 1px solid #CE93D8; border-radius: 8px;
+            padding: 12px 16px; max-width: 460px; font-size: 12px; color: #4A148C; margin-top: 18px;
+        }}
+        .modelo ul {{ margin: 6px 0 8px 18px; padding: 0; }}
+        .modelo a {{ color: #4527A0; font-weight: bold; }}
+    </style>
 </head>
 <body>
-<a class="voltar" href="/">← Voltar para a tabela</a>
-<h1>🙋 Adicionar dados meteorológicos</h1>
-<p class="info">Envie um arquivo CSV com seus dados (de uma planilha, estação caseira, etc.).
-Qualquer CSV é aceito, com as colunas que você já tiver. Cada linha vira um registro
-identificado como "Dados da Comunidade".</p>
-{mensagem_html}
-<form method="POST" action="/adicionar" enctype="multipart/form-data">
-<label>Nome ou apelido (usado se o CSV não tiver essa coluna)</label>
-<input type="text" name="nome" placeholder="Opcional">
-<label>Arquivo CSV</label>
-<input type="file" name="arquivo" accept=".csv" required>
-<button type="submit">Enviar CSV</button>
-</form>
-<div class="modelo">
-Nenhuma coluna é obrigatória. Colunas parecidas com estas são reconhecidas automaticamente
-(sem acento, "temp", "chuva" etc. também funcionam):
-<ul>{colunas_modelo}</ul>
-Qualquer outra coluna é mantida como veio.
-<br><a href="/modelo-comunidade.csv">📥 Baixar modelo de CSV (opcional)</a>
-</div>
+    <a class="voltar" href="/">← Voltar para a tabela</a>
+    <h1>🙋 Adicionar dados meteorológicos</h1>
+    <p class="info">Envie um arquivo CSV com seus dados (de uma planilha, estação caseira, etc.).
+       Qualquer CSV é aceito — pode ter as colunas que você já tiver, com o nome que já tiver;
+       não é preciso adaptar o arquivo a um formato específico. Cada linha do arquivo vira um
+       registro na tabela, identificado como "Dados da Comunidade".</p>
+
+    {mensagem_html}
+
+    <form method="POST" action="/adicionar" enctype="multipart/form-data">
+        <label>Nome ou apelido (usado se o CSV não tiver essa coluna)</label>
+        <input type="text" name="nome" placeholder="Opcional">
+
+        <label>Arquivo CSV</label>
+        <input type="file" name="arquivo" accept=".csv" required>
+
+        <button type="submit">Enviar CSV</button>
+    </form>
+
+    <div class="modelo">
+        Nenhuma coluna é obrigatória — pode enviar seu CSV do jeito que ele já está.
+        Se o arquivo tiver colunas parecidas com estas (sem precisar ser o nome exato — sem
+        acento, "temp", "chuva" etc. também são reconhecidos), elas são identificadas
+        automaticamente:
+        <ul>{colunas_modelo}</ul>
+        Qualquer outra coluna do arquivo é mantida do jeito que veio e também entra na tabela.
+        <br><a href="/modelo-comunidade.csv">📥 Baixar modelo de CSV (opcional, só como referência)</a>
+    </div>
 </body>
 </html>"""
 
-
 @app.route("/modelo-comunidade.csv")
 def modelo_comunidade_csv():
+    """CSV de exemplo com o cabeçalho esperado, pra facilitar quem for
+    montar o arquivo pra enviar em /adicionar."""
     linhas_exemplo = [
         CAMPOS_COMUNIDADE,
         ["Maria", "Cachoeira do Sul - Centro", "2026-09-02", "14:00",
@@ -1072,145 +1388,62 @@ def modelo_comunidade_csv():
         headers={"Content-Disposition": "attachment; filename=modelo-dados-comunidade.csv"},
     )
 
-
-@app.route("/graficos")
-def graficos():
-    with tabela_lock:
-        df_atual = tabela.copy()
-
-    if df_atual.empty:
-        return ("<h1>Ainda sem dados pra mostrar gráficos. "
-                "<a href='/'>Volte pra página principal</a> e aguarde a primeira coleta.</h1>")
-
-    cores = ["#1565C0", "#F2A65A", "#6FCF97", "#E88888", "#9575CD", "#4FD1E8", "#4527A0"]
-    fontes_disponiveis = list(df_atual["Estacao"].unique())
-
-    blocos_html = []
-    for metrica, info in METRICAS_HISTORICAS.items():
-        datasets_js = []
-        linhas_stats = []
-
-        for i, fonte in enumerate(fontes_disponiveis):
-            df_fonte = df_atual[df_atual["Estacao"] == fonte]
-            serie = extrair_serie_metrica(df_fonte, metrica)
-            if not serie:
-                continue
-
-            cor = cores[i % len(cores)]
-            pontos_js = ", ".join(f'{{x: "{p["data"]}", y: {p["valor"]}}}' for p in serie)
-            datasets_js.append(
-                f'{{label: "{fonte}", data: [{pontos_js}], borderColor: "{cor}", '
-                f'backgroundColor: "{cor}", tension: 0.25, pointRadius: 2, borderWidth: 2}}'
-            )
-
-            est = calcular_estatisticas(serie, info["unidade"])
-            if est:
-                u = info["unidade"]
-                linhas_stats.append(
-                    f"<tr><td>{html.escape(fonte)}</td>"
-                    f"<td>{est['media']} {u}</td><td>{est['minima']} {u}</td>"
-                    f"<td>{est['maxima']} {u}</td><td>{est['tendencia']}</td>"
-                    f"<td>{est['n_pontos']}</td></tr>"
-                )
-
-        if not datasets_js:
-            continue
-
-        canvas_id = f"grafico_{metrica}"
-        datasets_str = ", ".join(datasets_js)
-        titulo_y = f"{info['titulo']} ({info['unidade']})"
-
-        blocos_html.append(f"""
-<section class="bloco">
-<h2>{info['titulo']} ({info['unidade']})</h2>
-<canvas id="{canvas_id}" height="110"></canvas>
-<table class="stats">
-<thead><tr><th>Fonte</th><th>Média</th><th>Mínima</th><th>Máxima</th><th>Tendência</th><th>Pontos</th></tr></thead>
-<tbody>{''.join(linhas_stats)}</tbody>
-</table>
-<script>
-new Chart(document.getElementById("{canvas_id}"), {{
-  type: "line",
-  data: {{ datasets: [{datasets_str}] }},
-  options: {{ scales: {{ x: {{ type: "category" }}, y: {{ title: {{ display: true, text: "{titulo_y}" }} }} }} }}
-}});
-</script>
-</section>""")
-
-    corpo = "".join(blocos_html) or "<p>Nenhuma fonte tem dados reconhecíveis para gráficos no momento.</p>"
-
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Gráficos — Clima Unificado</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<style>
-body {{ font-family: Arial, sans-serif; margin: 20px; background: #f0f2f5; }}
-h1 {{ color: #1565C0; }}
-a.voltar {{ font-size: 13px; color: #1565C0; text-decoration: none; }}
-.bloco {{ background: white; border-radius: 10px; padding: 16px 20px; margin: 18px 0; box-shadow: 0 1px 4px rgba(0,0,0,.1); }}
-table.stats {{ border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 12px; }}
-table.stats th {{ background: #1565C0; color: white; padding: 6px; }}
-table.stats td {{ border: 1px solid #ddd; padding: 5px 6px; text-align: center; }}
-</style>
-</head>
-<body>
-<a class="voltar" href="/">← Voltar para a tabela</a>
-<h1>📊 Gráficos e tendências</h1>
-{corpo}
-</body>
-</html>"""
-
-
-def _data_mais_recente_por_fonte(df):
-    resultado = {}
-    if df.empty:
-        return resultado
-    for fonte in df["Estacao"].unique():
-        df_f = df[df["Estacao"] == fonte]
-        col_data = encontrar_coluna(df_f.columns, "DATA") or encontrar_coluna(df_f.columns, "DT", "MEDICAO")
-        if col_data is None:
-            resultado[fonte] = "coluna de data não encontrada"
-            continue
-        try:
-            datas = df_f[col_data].astype(str)
-            col_hora = encontrar_coluna(df_f.columns, "HORA") or encontrar_coluna(df_f.columns, "HR", "MEDICAO")
-            if col_hora is not None:
-                datas = datas + " " + df_f[col_hora].astype(str)
-            resultado[fonte] = datas.max() if len(datas) else "sem dados"
-        except Exception as e:
-            resultado[fonte] = f"erro ao calcular: {e}"
-    return resultado
-
-
 @app.route("/status")
 def status():
+    """
+    Endpoint para checar se o servidor está vivo (útil para keep-alive) e,
+    mais importante: mostra a data/hora mais recente presente em cada
+    fonte de dados. Use isso pra confirmar rapidamente se o INMET está
+    atrasado na fonte (limitação deles) ou se o app parou de atualizar
+    (bug/deploy), sem precisar abrir o Sheets ou os Logs do Render.
+    """
     with tabela_lock:
         df_atual = tabela.copy()
-    datas = _data_mais_recente_por_fonte(df_atual)
-    linhas = "".join(f"<li><strong>{html.escape(f)}</strong>: {html.escape(str(d))}</li>"
-                     for f, d in datas.items())
-    ultima = ultima_atualizacao.strftime("%d/%m/%Y %H:%M:%S") if ultima_atualizacao else "—"
-    return (f"<h1>Status</h1><p>Última atualização: {ultima}</p>"
-            f"<ul>{linhas or '<li>Sem dados ainda</li>'}</ul>"
-            f"<a href='/'>← Voltar</a>")
+    return {
+        "ok": True,
+        "ultima_atualizacao_do_app": str(ultima_atualizacao),
+        "dado_mais_recente_por_fonte": _data_mais_recente_por_fonte(df_atual),
+        "total_registros": len(df_atual),
+    }
+
+@app.route("/atualizar")
+def forcar_atualizacao():
+    """
+    Dispara uma atualização manual (útil para testar sem esperar o agendador).
+    O INMET agora usa a API de tempo real a cada ciclo, então normalmente
+    não precisa de nenhum parâmetro especial. Use /atualizar?inmet=1 apenas
+    se quiser forçar o caminho de RESERVA (ZIP anual) a ignorar o cache de
+    hash e reprocessar mesmo sem mudança — útil só se a API de tempo real
+    estiver fora do ar e você quiser testar o fallback.
+    """
+    forcar_inmet = flask_request.args.get("inmet") == "1"
+    threading.Thread(target=atualizar_dados, kwargs={"forcar_inmet": forcar_inmet}, daemon=True).start()
+    mensagem = "Atualização disparada em segundo plano."
+    if forcar_inmet:
+        mensagem += " Cache de reserva (ZIP) forçado a reprocessar, se for usado."
+    return {"ok": True, "mensagem": mensagem}
+
+def gerar_linhas(df):
+    html = ""
+    for _, row in df.iterrows():
+        estacao = str(row.get("Estacao", ""))
+        css     = FONTE_CSS.get(estacao, "")
+        celulas = "".join(f"<td>{v}</td>" for v in row)
+        html   += f'<tr class="row {css}">{celulas}</tr>\n'
+    return html
 
 # ==========================================================
-# INICIALIZAÇÃO
+# EXECUÇÃO PRINCIPAL
 # ==========================================================
-
-
-def _iniciar_em_segundo_plano():
-    try:
-        atualizar_dados()
-    except Exception as e:
-        log.error(f"Erro na primeira coleta: {e}")
-    agendador()
-
-
-threading.Thread(target=_iniciar_em_segundo_plano, daemon=True).start()
 
 if __name__ == "__main__":
-    porta = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=porta)
+    log.info("Buscando dados iniciais...")
+    atualizar_dados()
+
+    threading.Thread(target=agendador, daemon=True).start()
+
+    porta = int(os.environ.get("PORT", 5000))
+    log.info(f"Servidor iniciado na porta {porta}")
+    if GSHEETS_ATIVO:
+        log.info(f"PLANILHA GOOGLE SHEETS: {GSHEETS_LINK}")
+    app.run(host="0.0.0.0", port=porta, threaded=True)
