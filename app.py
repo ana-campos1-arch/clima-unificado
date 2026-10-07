@@ -18,36 +18,25 @@
 #
 # O QUE MUDOU NESTA VERSÃO
 # ─────────────────────────────────────────────────────────
-#  • NOVO: aba "Gráficos" na planilha de destino, com dois gráficos
-#    de linha nativos do Google Sheets montados a partir dos dados do
-#    Open-Meteo: a variação da temperatura hora a hora de hoje e as
-#    máximas/mínimas dos próximos 7 dias. Os gráficos são criados uma
-#    única vez; nos ciclos seguintes só os números são reescritos e os
-#    gráficos se atualizam sozinhos.
-#  • MUDANÇA PRINCIPAL: o INMET agora é coletado pela API de TEMPO REAL
-#    (apitempo.inmet.gov.br), que devolve dado hora a hora direto da
-#    estação — assim como o Open-Meteo. O ZIP histórico anual (que passa
-#    por controle de qualidade e fica 1-3 semanas atrasado) só entra
-#    como RESERVA automática, caso a API de tempo real esteja fora do
-#    ar ou pare de responder para todas as estações.
-#  • O caminho de reserva (ZIP) continua comparando por HASH do
-#    conteúdo baixado (não cabeçalhos HTTP, que não são confiáveis).
-#  • Se o ZIP do ano corrente ainda não existir no INMET (comum no
-#    início de janeiro), o caminho de reserva cai para o ano anterior.
-#  • Chamadas de rede (Open-Meteo, INMET, Google Sheets) têm retries
-#    com backoff exponencial.
-#  • Logging estruturado (nível, hora) no lugar de print().
-#  • Google Sheets só reescreve uma aba se os dados dela realmente
-#    mudaram (evita bater no limite de requisições da API).
-#  • /status mostra a data/hora mais recente de cada fonte de dados,
-#    reconhecendo tanto os nomes de coluna do ZIP quanto da API.
-#  • Coleta de radiação solar (Open-Meteo hora a hora e previsão
-#    diária). Para o INMET e a Estação Meteorológica, a radiação já
-#    entra automaticamente se a fonte fornecer essa coluna — nada
-#    precisou mudar nesses dois caminhos.
+#  • NOVO: aba "📈 Gráficos" na interface principal (ao lado das abas
+#    do Open-Meteo e das demais fontes). Mostra a temperatura de hoje
+#    hora a hora e as máximas/mínimas da semana sem precisar abrir a
+#    tabela. Os gráficos são desenhados no navegador (Chart.js), então
+#    o servidor não monta tabela nem chama o Google Sheets nessa aba.
+#  • Aba "Gráficos" na planilha de destino (gráficos nativos do Google
+#    Sheets) continua sendo atualizada normalmente.
+#  • O INMET é coletado pela API de TEMPO REAL (apitempo.inmet.gov.br).
+#    O ZIP histórico anual só entra como RESERVA automática.
+#  • Reserva (ZIP) compara por HASH do conteúdo; cai para o ano anterior
+#    se o ZIP do ano corrente ainda não existir.
+#  • Retries com backoff exponencial, logging estruturado, e o Sheets
+#    só reescreve uma aba se os dados realmente mudaram.
+#  • /status mostra a data/hora mais recente de cada fonte de dados.
+#  • Coleta de radiação solar (Open-Meteo hora a hora e diária).
 # ==========================================================
 
 import io
+import json
 import logging
 import os
 import threading
@@ -88,11 +77,8 @@ ESTACOES = {
 ANO_ATUAL = date.today().year
 URL_INMET_BASE = "https://portal.inmet.gov.br/uploads/dadoshistoricos/{ano}.zip"
 
-# De quantas em quantas horas o ciclo de atualização roda. Vale tanto para
-# Open-Meteo quanto para o INMET, já que agora o INMET usa a API de tempo
-# real (hora a hora), no mesmo ritmo do Open-Meteo. O ZIP histórico anual
-# só entra como reserva automática se a API do INMET falhar (veja a seção
-# "INMET" mais abaixo).
+# De quantas em quantas horas o ciclo de atualização roda (Open-Meteo e
+# INMET API de tempo real). O ZIP anual só entra como reserva.
 INTERVALO_ATUALIZACAO_HORAS = 1
 
 # ── Google Sheets ────────────────────────────────────────
@@ -105,15 +91,13 @@ GSHEETS_LINK        = os.environ.get(
 )
 
 # ── Estação Meteorológica (planilha externa, fonte adicional) ──────
-# Essa é uma planilha DIFERENTE da planilha de destino acima — é onde
-# a estação física já registra os dados. O app só LÊ dela e copia os
-# dados para dentro da tabela unificada / da planilha de destino.
+# Planilha DIFERENTE da de destino: onde a estação física registra os
+# dados. O app só LÊ dela e copia para a tabela unificada.
 ESTACAO_METEO_SHEET_ID = os.environ.get(
     "ESTACAO_METEO_SHEET_ID",
     "1t2ZztZ7zBMZD148G4Ib6USTTkVVe4hWnS-CGgEd7CQM",
 )
-# Nome da aba a ler dentro dessa planilha externa. Deixe em branco para
-# usar a primeira aba automaticamente.
+# Nome da aba a ler. Deixe em branco para usar a primeira aba.
 ESTACAO_METEO_ABA = os.environ.get("ESTACAO_METEO_ABA", "")
 
 # ==========================================================
@@ -131,12 +115,8 @@ FONTE_CSS = {
 }
 
 # ── Dados da Comunidade (formulário público em /adicionar) ─────────
-# Qualquer pessoa com acesso ao site pode enviar seus próprios dados
-# meteorológicos pelo formulário público. Cada envio é gravado direto
-# numa aba própria ("Dados da Comunidade") dentro da MESMA planilha de
-# destino (GSHEETS_NOME) — não é uma planilha separada. Essa aba é
-# relida a cada ciclo (coletar_dados_comunidade) e entra na tabela
-# unificada, igual às outras fontes.
+# Cada envio é gravado numa aba própria ("Dados da Comunidade") dentro
+# da MESMA planilha de destino, relida a cada ciclo.
 DADOS_COMUNIDADE_ABA = "Dados da Comunidade"
 CAMPOS_COMUNIDADE = [
     "Nome/Apelido", "Cidade/Bairro", "Data", "Hora",
@@ -281,19 +261,14 @@ def _obter_cliente_gspread():
 
 def coletar_estacao_meteorologica():
     """
-    Lê os dados já lançados na planilha da estação meteorológica física
-    e devolve como DataFrame, com a coluna "Estacao" preenchida, para
-    entrar junto na tabela unificada.
+    Lê os dados da planilha da estação meteorológica física e devolve
+    como DataFrame, com a coluna "Estacao" preenchida.
 
-    IMPORTANTE: essa planilha externa precisa estar compartilhada (papel:
-    Leitor ou Editor) com o e-mail da mesma Service Account usada nas
-    outras credenciais do Google Sheets — senão a leitura falha com erro
-    de permissão.
+    IMPORTANTE: essa planilha precisa estar compartilhada (Leitor ou
+    Editor) com o e-mail da Service Account — senão a leitura falha.
 
-    Se a planilha da estação já tiver uma coluna de radiação solar (por
-    exemplo, vinda de um piranômetro/sensor físico), ela entra automati-
-    camente aqui junto com as demais colunas — não precisa de nenhuma
-    mudança neste trecho.
+    Se a planilha tiver coluna de radiação solar, ela entra
+    automaticamente junto com as demais colunas.
     """
     if not ESTACAO_METEO_SHEET_ID:
         return pd.DataFrame()
@@ -324,9 +299,7 @@ def coletar_estacao_meteorologica():
 def coletar_dados_comunidade():
     """
     Relê a aba "Dados da Comunidade" (mesma planilha de destino) e devolve
-    como DataFrame, para entrar junto na tabela unificada. Cada envio do
-    formulário público já grava direto nessa aba (ver _salvar_dado_comunidade
-    e a rota /adicionar); esta função só busca o que já está lá.
+    como DataFrame, para entrar junto na tabela unificada.
     """
     if not GSHEETS_ATIVO:
         return pd.DataFrame()
@@ -356,12 +329,10 @@ def _salvar_dados_comunidade(linhas):
     """
     Grava várias linhas de uma vez (append_rows) na aba "Dados da
     Comunidade", criando a aba com o cabeçalho se ainda não existir.
-    Chamada pela rota /adicionar depois que o CSV enviado é processado.
 
-    Como agora qualquer CSV é aceito (não só o formato fixo de
-    CAMPOS_COMUNIDADE), o cabeçalho da aba é ajustado dinamicamente:
-    colunas novas trazidas por um envio são acrescentadas ao final do
-    cabeçalho já existente, sem apagar nem reordenar o que já estava lá.
+    Como qualquer CSV é aceito, o cabeçalho da aba é ajustado
+    dinamicamente: colunas novas são acrescentadas ao final do cabeçalho
+    existente, sem apagar nem reordenar o que já estava lá.
     """
     if not linhas:
         return
@@ -373,9 +344,6 @@ def _salvar_dados_comunidade(linhas):
     gc = _obter_cliente_gspread()
     sh = gc.open(GSHEETS_NOME)
 
-    # Colunas trazidas por este envio específico, na ordem em que
-    # aparecem nas linhas (já vem com as conhecidas primeiro, veja
-    # _processar_csv_comunidade).
     colunas_envio = []
     for linha in linhas:
         for col in linha.keys():
@@ -401,11 +369,6 @@ def _salvar_dados_comunidade(linhas):
     ws.append_rows(valores)
 
 # ── Reconhecimento das colunas do CSV enviado pela pessoa ──────────
-# As pessoas podem exportar a planilha delas com nomes de coluna
-# ligeiramente diferentes (com/sem acento, maiúsculas, "temp" em vez de
-# "temperatura", etc). Este dicionário normaliza tudo pro nome oficial
-# usado na aba "Dados da Comunidade".
-
 ALIASES_COMUNIDADE = {
     "nome": "Nome/Apelido", "apelido": "Nome/Apelido", "nome/apelido": "Nome/Apelido",
     "nome apelido": "Nome/Apelido",
@@ -427,9 +390,7 @@ ALIASES_COMUNIDADE = {
 }
 
 def _normalizar_texto(txt):
-    """Minúsculas, sem acento e sem espaços nas pontas — usado para casar
-    nomes de coluna do CSV com ALIASES_COMUNIDADE, mesmo com pequenas
-    diferenças de grafia."""
+    """Minúsculas, sem acento e sem espaços nas pontas."""
     import unicodedata
     txt = str(txt).strip().lower()
     txt = "".join(c for c in unicodedata.normalize("NFKD", txt) if not unicodedata.combining(c))
@@ -445,21 +406,12 @@ def _mapear_colunas_csv(df):
 
 def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
     """
-    Lê o CSV enviado pela pessoa e devolve uma lista de linhas prontas
-    para gravar na aba "Dados da Comunidade", além do total de linhas
-    lidas e de quantas foram ignoradas (só as completamente vazias).
+    Lê o CSV enviado e devolve (linhas_validas, total, ignoradas).
 
-    ACEITA QUALQUER CSV, com qualquer conjunto de colunas — não exige
-    mais nenhuma coluna específica (antes "Cidade/Bairro" e
-    "Temperatura (°C)" eram obrigatórias). Colunas com nomes reconhecidos
-    (ver ALIASES_COMUNIDADE) continuam sendo renomeadas para o padrão
-    usado no resto do app (ex.: "temp" → "Temperatura (°C)"); qualquer
-    outra coluna do arquivo é mantida do jeito que veio e passa a
-    aparecer normalmente na tabela unificada, como uma coluna a mais.
-
-    Aceita separador por vírgula ou ponto e vírgula (detecção automática)
-    e tenta UTF-8 antes de cair para Latin-1 (comum em CSV exportado do
-    Excel no Brasil).
+    ACEITA QUALQUER CSV, com qualquer conjunto de colunas. Colunas com
+    nomes reconhecidos (ALIASES_COMUNIDADE) são renomeadas para o padrão;
+    as demais são mantidas como vieram. Separador por vírgula ou ponto e
+    vírgula (detecção automática); tenta UTF-8 e cai para Latin-1.
     """
     texto = None
     for encoding in ("utf-8-sig", "latin1"):
@@ -481,9 +433,6 @@ def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
     agora = datetime.now()
     total = len(df)
 
-    # Nome/Apelido, Data e Hora sempre recebem um valor padrão quando
-    # ausentes ou em branco, pra toda linha ficar identificável e
-    # ordenável na tabela unificada — mas nenhuma outra coluna é exigida.
     if "Nome/Apelido" not in df.columns:
         df["Nome/Apelido"] = ""
     df.loc[df["Nome/Apelido"] == "", "Nome/Apelido"] = nome_padrao or "Anônimo"
@@ -496,8 +445,6 @@ def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
         df["Hora"] = ""
     df.loc[df["Hora"] == "", "Hora"] = agora.strftime("%H:%M")
 
-    # Reordena só pra ficar mais legível: colunas conhecidas primeiro,
-    # colunas extras do CSV original depois, na ordem em que vieram.
     ordem_conhecida = [c for c in CAMPOS_COMUNIDADE if c in df.columns]
     extras          = [c for c in df.columns if c not in CAMPOS_COMUNIDADE]
     df = df[ordem_conhecida + extras]
@@ -505,9 +452,6 @@ def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
     linhas_validas = []
     for _, row in df.iterrows():
         linha = row.to_dict()
-        # Uma linha só é ignorada se estiver 100% vazia fora de
-        # Nome/Apelido, Data e Hora (que já vêm preenchidos por padrão
-        # acima e não indicam, sozinhos, que a linha tem dado real).
         outros_valores = [v for k, v in linha.items() if k not in ("Nome/Apelido", "Data", "Hora")]
         if outros_valores and not any(v.strip() for v in outros_valores):
             continue
@@ -520,32 +464,20 @@ def _processar_csv_comunidade(conteudo_bytes, nome_padrao):
 # INMET — API de tempo real (fonte principal) + ZIP anual (reserva)
 # ==========================================================
 #
-# O INMET tem duas fontes bem diferentes:
-#   1) API de tempo real (apitempo.inmet.gov.br) — dado hora a hora,
-#      direto da estação, sem passar pelo controle de qualidade demorado.
-#      É esta que faz o INMET atualizar "como o Open-Meteo".
-#   2) ZIP histórico anual (dadoshistoricos) — passa por controle de
-#      qualidade, por isso fica 1-3 semanas atrasado. Usado aqui só como
-#      RESERVA, caso a API de tempo real esteja fora do ar ou tenha
-#      mudado de contrato (isso já aconteceu antes com bibliotecas que
-#      dependem dela, então a checagem por hash de conteúdo continua
-#      valendo para esse caminho de reserva).
+# 1) API de tempo real (apitempo.inmet.gov.br): dado hora a hora.
+# 2) ZIP histórico anual: passa por controle de qualidade (1-3 semanas
+#    de atraso). Usado só como RESERVA.
 #
-# Ambas as fontes do INMET já trazem sua própria coluna de radiação solar
-# global quando disponível (ex.: "RAD_GLO" na API de tempo real, ou
-# "RADIACAO GLOBAL (Kj/m²)" no ZIP histórico). Como o código abaixo só
-# repassa todas as colunas que a fonte devolve, essa radiação já aparece
-# na tabela unificada sem precisar de nenhuma alteração aqui.
+# Ambas já trazem a coluna de radiação solar quando disponível; como o
+# código só repassa as colunas devolvidas, ela aparece sem alterações.
 
 URL_INMET_API_BASE = "https://apitempo.inmet.gov.br/estacao/{inicio}/{fim}/{codigo}"
 
 def coletar_inmet_api():
     """
     Busca o dado hora a hora mais recente de cada estação via API de
-    tempo real do INMET. Pede os últimos 2 dias (não só "hoje") como
-    margem de segurança contra atraso de transmissão da estação/fuso.
-    Retorna um DataFrame vazio se a API não responder para NENHUMA
-    estação (sinal de que ela pode estar fora do ar/mudou de contrato).
+    tempo real do INMET (últimos 2 dias, como margem de segurança).
+    Retorna DataFrame vazio se a API não responder para NENHUMA estação.
     """
     hoje    = date.today()
     inicio  = (hoje - timedelta(days=2)).isoformat()
@@ -602,8 +534,8 @@ def _resolver_url_inmet_zip(sessao):
 def coletar_inmet_zip_reserva(forcar=False):
     """
     Caminho de reserva: baixa o ZIP histórico anual e só reprocessa se o
-    CONTEÚDO mudou (hash SHA-256) desde a última vez. Só é chamado quando
-    a API de tempo real falha para todas as estações.
+    CONTEÚDO mudou (hash SHA-256). Só é chamado quando a API de tempo
+    real falha para todas as estações.
     """
     import hashlib
 
@@ -660,9 +592,8 @@ def coletar_inmet_zip_reserva(forcar=False):
 def coletar_inmet(forcar=False):
     """
     Ponto de entrada único usado por montar_tabela(). Tenta a API de
-    tempo real primeiro (dado hora a hora). Se ela não devolver nada
-    para nenhuma estação, cai automaticamente para o ZIP histórico como
-    reserva. Retorna: (DataFrame, houve_atualizacao: bool)
+    tempo real primeiro; se ela não devolver nada, cai para o ZIP.
+    Retorna: (DataFrame, houve_atualizacao: bool)
     """
     df_api = coletar_inmet_api()
     if not df_api.empty:
@@ -697,9 +628,6 @@ _ultimo_bloco_inmet = pd.DataFrame()
 # ==========================================================
 # DIAGNÓSTICO — registra o resultado de cada coleta, fonte a fonte
 # ==========================================================
-# Serve pra gerar a aba "Diagnóstico" no Sheets, que muda a cada ciclo
-# (tem timestamp), então é uma forma visual de confirmar que o app está
-# rodando de verdade, sem precisar abrir logs do Render.
 
 _diagnostico_lock = threading.Lock()
 _diagnostico = {}  # fonte -> {"ok": bool, "registros": int, "detalhe": str, "hora": datetime}
@@ -740,10 +668,8 @@ def montar_aba_diagnostico():
 
 def montar_tabela(forcar_inmet=False):
     """
-    forcar_inmet: repassado para o caminho de reserva (ZIP anual), caso a
-    API de tempo real esteja indisponível — ignora o cache de hash e força
-    reprocessar o ZIP. Não tem efeito quando a API de tempo real responde
-    normalmente (que é o caso mais comum).
+    forcar_inmet: repassado ao caminho de reserva (ZIP anual); ignora o
+    cache de hash. Sem efeito quando a API de tempo real responde.
     """
     global _ultimo_bloco_inmet
 
@@ -752,10 +678,6 @@ def montar_tabela(forcar_inmet=False):
     df_estacao    = coletar_estacao_meteorologica()
     df_comunidade = coletar_dados_comunidade()
 
-    # A API de tempo real do INMET traz dado hora a hora, então é checada
-    # a cada ciclo — igual o Open-Meteo. Se ela falhar, coletar_inmet()
-    # cai sozinha para o ZIP anual como reserva (esse sim mais raro de
-    # mudar, mas ainda assim comparado por hash pra não reprocessar à toa).
     df_inmet_novo, inmet_mudou = coletar_inmet(forcar=forcar_inmet)
     if inmet_mudou and not df_inmet_novo.empty:
         _ultimo_bloco_inmet = df_inmet_novo
@@ -813,24 +735,15 @@ def _escrever_aba_com_retry(sh, nome_aba, dados, tentativas=3, pular_dedup=False
     log.error(f"Falha ao escrever aba '{nome_aba}' após {tentativas} tentativas.")
 
 # ==========================================================
-# ABA "GRÁFICOS" — temperatura do dia e da semana (Open-Meteo)
+# GRÁFICOS — dados (compartilhados pelo Sheets e pela interface web)
 # ==========================================================
 #
-# Cria/atualiza uma aba "Gráficos" com dois blocos de dados NUMÉRICOS
-# vindos do Open-Meteo:
+# Aba "Gráficos" no Sheets: dois blocos NUMÉRICOS do Open-Meteo
 #     A:B  -> temperatura hora a hora de hoje
 #     D:F  -> máxima e mínima dos próximos 7 dias
-# Na primeira execução, insere dois gráficos de linha nativos do Google
-# Sheets apontando para esses blocos. Nos ciclos seguintes só reescreve
-# os números — os gráficos já existentes se atualizam sozinhos.
-#
-# Os dados são gravados aqui por uma função própria (e não por
-# _escrever_aba_com_retry) porque aquela converte tudo em texto, e o
-# Sheets não plota texto: gráfico precisa de número de verdade.
-#
-# As faixas usadas pelos gráficos vão até a linha 200 de propósito —
-# sobra espaço se um dia forem mais horas/dias, e célula vazia
-# simplesmente não é plotada.
+# Os gráficos nativos são criados uma vez; depois só os números mudam.
+# Gravados por função própria porque _escrever_aba_com_retry converte
+# tudo em texto, e o Sheets não plota texto.
 
 ABA_GRAFICOS = "Gráficos"
 _GRAF_LINHAS_MAX = 200
@@ -952,7 +865,6 @@ def _atualizar_aba_graficos(sh, df):
                 value_input_option="USER_ENTERED",
             )
 
-        # Os gráficos são criados uma única vez; depois só os números mudam.
         metadados = sh.fetch_sheet_metadata(
             params={"fields": "sheets(properties(sheetId,title),charts(chartId))"}
         )
@@ -1002,9 +914,8 @@ def exportar_para_sheets(df):
         gc = _obter_cliente_gspread()
         sh = gc.open(GSHEETS_NOME)
 
-        # A aba Diagnóstico é escrita SEMPRE, mesmo se a tabela principal
-        # estiver vazia — é ela que prova visualmente que o ciclo rodou,
-        # porque tem um timestamp que muda a cada execução.
+        # A aba Diagnóstico é escrita SEMPRE: prova visualmente que o
+        # ciclo rodou (tem timestamp que muda a cada execução).
         _escrever_aba_com_retry(sh, "Diagnóstico", montar_aba_diagnostico(), pular_dedup=True)
 
         if df.empty:
@@ -1072,6 +983,33 @@ def agendador():
 
 app = Flask(__name__)
 
+def _html_graficos(df):
+    """
+    Gráficos da aba "📈 Gráficos" da interface. Desenhados no navegador
+    com Chart.js a partir dos mesmos dados de _dados_graficos(); o
+    servidor só serializa os números (não monta tabela nem usa o Sheets).
+    """
+    horas, dias = _dados_graficos(df)
+    if not horas and not dias:
+        return "<p>Sem dados do Open-Meteo ainda.</p>"
+    return f"""
+    <div class="graf"><canvas id="g1"></canvas></div>
+    <div class="graf"><canvas id="g2"></canvas></div>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script>
+    const H = {json.dumps(horas)}, D = {json.dumps(dias)};
+    new Chart(document.getElementById('g1'), {{type:'line', data:{{
+      labels: H.map(r => r[0]),
+      datasets:[{{label:'Temperatura (°C)', data:H.map(r => r[1]), borderColor:'#1565C0', tension:.3}}]}},
+      options:{{plugins:{{title:{{display:true, text:'Temperatura hoje (hora a hora) — Open-Meteo'}}}}}}}});
+    new Chart(document.getElementById('g2'), {{type:'line', data:{{
+      labels: D.map(r => r[0]),
+      datasets:[
+        {{label:'Máx (°C)', data:D.map(r => r[1]), borderColor:'#E53935', tension:.3}},
+        {{label:'Mín (°C)', data:D.map(r => r[2]), borderColor:'#1E88E5', tension:.3}}]}},
+      options:{{plugins:{{title:{{display:true, text:'Máxima e mínima da semana — Open-Meteo'}}}}}}}});
+    </script>"""
+
 @app.route("/")
 def inicio():
     with tabela_lock:
@@ -1082,21 +1020,27 @@ def inicio():
 
     fontes      = list(df_atual["Estacao"].unique())
     fonte_ativa = flask_request.args.get("fonte", "todas")
+    eh_graf     = fonte_ativa == "graficos"
 
-    df_exibir = df_atual if fonte_ativa == "todas" else \
+    df_exibir = df_atual if fonte_ativa in ("todas", "graficos") else \
                 df_atual[df_atual["Estacao"] == fonte_ativa]
 
-    if fonte_ativa == "todas":
-        colunas_mostrar = list(df_atual.columns)
+    if eh_graf:
+        conteudo = _html_graficos(df_atual)
     else:
-        colunas_mostrar = [c for c in df_atual.columns if df_exibir[c].notna().any()]
-        if "Estacao" not in colunas_mostrar:
-            colunas_mostrar = ["Estacao"] + colunas_mostrar
-
-    cabecalho_html = "".join(f"<th>{col}</th>" for col in colunas_mostrar)
-    linhas_html    = gerar_linhas(df_exibir[colunas_mostrar].fillna("—").head(500))
+        if fonte_ativa == "todas":
+            colunas_mostrar = list(df_atual.columns)
+        else:
+            colunas_mostrar = [c for c in df_atual.columns if df_exibir[c].notna().any()]
+            if "Estacao" not in colunas_mostrar:
+                colunas_mostrar = ["Estacao"] + colunas_mostrar
+        cabecalho_html = "".join(f"<th>{col}</th>" for col in colunas_mostrar)
+        linhas_html    = gerar_linhas(df_exibir[colunas_mostrar].fillna("—").head(500))
+        conteudo = (f'<div class="wrapper"><table><thead><tr>{cabecalho_html}</tr></thead>'
+                    f'<tbody>{linhas_html}</tbody></table></div>')
 
     botoes = f'<a href="/" class="btn btn-todas {"btn-ativo" if fonte_ativa=="todas" else ""}">🌐 Todas</a>\n'
+    botoes += f'<a href="/?fonte=graficos" class="btn src-om-hora {"btn-ativo" if eh_graf else ""}">📈 Gráficos</a>\n'
     icones = {
         "Open-Meteo – Hoje (horário)":      "🕐",
         "Open-Meteo – Previsão (diária)":   "📅",
@@ -1114,7 +1058,7 @@ def inicio():
         botoes += f'<a href="{url}" class="btn {css} {ativo}">{ico} {fonte}</a>\n'
 
     total   = len(df_atual)
-    exibido = min(500, len(df_exibir))
+    exibido = 0 if eh_graf else min(500, len(df_exibir))
     rodape_atualizacao = (
         ultima_atualizacao.strftime("%d/%m/%Y às %H:%M:%S")
         if ultima_atualizacao else "—"
@@ -1177,6 +1121,8 @@ def inicio():
         .src-sm-conv        {{ background: #F8BBD0; color: #880E4F; }}
         .src-comunidade     {{ background: #D1C4E9; color: #4527A0; }}
 
+        .graf {{ background: white; border-radius: 8px; padding: 12px; margin-bottom: 16px; max-width: 900px; }}
+
         .wrapper {{ overflow-x: auto; }}
         table    {{ border-collapse: collapse; width: 100%; font-size: 12px; background: white; min-width: 900px; }}
         thead th {{
@@ -1208,22 +1154,15 @@ def inicio():
         {botoes}
     </div>
 
-    <div class="wrapper">
-        <table>
-            <thead><tr>{cabecalho_html}</tr></thead>
-            <tbody>{linhas_html}</tbody>
-        </table>
-    </div>
+    {conteudo}
 </body>
 </html>"""
 
 def _data_mais_recente_por_fonte(df):
     """
-    Para cada fonte na tabela, tenta achar a data/hora mais recente presente
-    nos dados. Reconhece tanto os nomes de coluna do ZIP histórico
-    ('Data', 'Hora') quanto os da API de tempo real do INMET
-    ('DT_MEDICAO', 'HR_MEDICAO'). Usado só para diagnóstico no /status —
-    não afeta a lógica de coleta/atualização.
+    Para cada fonte, acha a data/hora mais recente nos dados. Reconhece
+    as colunas do ZIP ('Data', 'Hora') e da API do INMET ('DT_MEDICAO',
+    'HR_MEDICAO'). Usado só para diagnóstico no /status.
     """
     resultado = {}
     if df.empty:
@@ -1250,18 +1189,13 @@ def _data_mais_recente_por_fonte(df):
 @app.route("/adicionar", methods=["GET", "POST"])
 def adicionar_dado():
     """
-    Formulário público: qualquer pessoa com acesso ao site pode enviar
-    seus próprios dados meteorológicos enviando um arquivo CSV (ex.:
-    exportado de uma planilha, estação caseira, pluviômetro). QUALQUER
-    CSV é aceito, com qualquer conjunto de colunas — não há mais um
-    formato fixo obrigatório (ver _processar_csv_comunidade). As linhas
-    válidas são gravadas na aba "Dados da Comunidade" e entram na tabela
-    unificada (coletar_dados_comunidade), junto com as demais fontes.
+    Formulário público: qualquer pessoa pode enviar um CSV com dados
+    meteorológicos próprios (qualquer conjunto de colunas). As linhas
+    válidas vão para a aba "Dados da Comunidade" e entram na tabela
+    unificada.
 
-    ATENÇÃO: não há login nem validação de veracidade — qualquer um pode
-    enviar qualquer valor. Os dados aparecem claramente identificados como
-    "Dados da Comunidade" (não misturados com INMET/Open-Meteo) para deixar
-    claro que são autodeclarados.
+    ATENÇÃO: não há login nem validação de veracidade. Os dados aparecem
+    identificados como "Dados da Comunidade" (autodeclarados).
     """
     erro        = None
     sucesso_qtd = None
@@ -1285,8 +1219,7 @@ def adicionar_dado():
                 else:
                     _salvar_dados_comunidade(linhas)
                     sucesso_qtd = len(linhas)
-                    # atualiza a tabela em segundo plano pra já refletir os
-                    # novos dados sem esperar o próximo ciclo agendado
+                    # atualiza a tabela em segundo plano
                     threading.Thread(target=atualizar_dados, daemon=True).start()
             except Exception as e:
                 log.error(f"Erro ao processar CSV da comunidade: {e}")
@@ -1374,8 +1307,7 @@ def adicionar_dado():
 
 @app.route("/modelo-comunidade.csv")
 def modelo_comunidade_csv():
-    """CSV de exemplo com o cabeçalho esperado, pra facilitar quem for
-    montar o arquivo pra enviar em /adicionar."""
+    """CSV de exemplo com o cabeçalho esperado."""
     linhas_exemplo = [
         CAMPOS_COMUNIDADE,
         ["Maria", "Cachoeira do Sul - Centro", "2026-09-02", "14:00",
@@ -1391,11 +1323,8 @@ def modelo_comunidade_csv():
 @app.route("/status")
 def status():
     """
-    Endpoint para checar se o servidor está vivo (útil para keep-alive) e,
-    mais importante: mostra a data/hora mais recente presente em cada
-    fonte de dados. Use isso pra confirmar rapidamente se o INMET está
-    atrasado na fonte (limitação deles) ou se o app parou de atualizar
-    (bug/deploy), sem precisar abrir o Sheets ou os Logs do Render.
+    Checa se o servidor está vivo (útil para keep-alive) e mostra a
+    data/hora mais recente presente em cada fonte de dados.
     """
     with tabela_lock:
         df_atual = tabela.copy()
@@ -1409,12 +1338,8 @@ def status():
 @app.route("/atualizar")
 def forcar_atualizacao():
     """
-    Dispara uma atualização manual (útil para testar sem esperar o agendador).
-    O INMET agora usa a API de tempo real a cada ciclo, então normalmente
-    não precisa de nenhum parâmetro especial. Use /atualizar?inmet=1 apenas
-    se quiser forçar o caminho de RESERVA (ZIP anual) a ignorar o cache de
-    hash e reprocessar mesmo sem mudança — útil só se a API de tempo real
-    estiver fora do ar e você quiser testar o fallback.
+    Dispara uma atualização manual. Use /atualizar?inmet=1 apenas para
+    forçar o caminho de RESERVA (ZIP anual) a ignorar o cache de hash.
     """
     forcar_inmet = flask_request.args.get("inmet") == "1"
     threading.Thread(target=atualizar_dados, kwargs={"forcar_inmet": forcar_inmet}, daemon=True).start()
