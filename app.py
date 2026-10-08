@@ -95,7 +95,7 @@ GSHEETS_LINK        = os.environ.get(
 # dados. O app só LÊ dela e copia para a tabela unificada.
 ESTACAO_METEO_SHEET_ID = os.environ.get(
     "ESTACAO_METEO_SHEET_ID",
-    "1t2ZztZ7zBMZD148G4Ib6USTTkVVe4hWnS-CGgEd7CQM",
+    "1Vxkjf4LC5h72mAy6rtWfvfz-Bw_sx6LYkklLhIueddU",
 )
 # Nome da aba a ler. Deixe em branco para usar a primeira aba.
 ESTACAO_METEO_ABA = os.environ.get("ESTACAO_METEO_ABA", "")
@@ -641,27 +641,6 @@ def _marcar_diagnostico(fonte, ok, registros=0, detalhe=""):
             "hora": datetime.now(),
         }
 
-def montar_aba_diagnostico():
-    """Monta um DataFrame simples pra aba 'Diagnóstico' do Sheets."""
-    agora = datetime.now()
-    linhas = [{
-        "Fonte": "── ÚLTIMA EXECUÇÃO DO CICLO ──",
-        "Status": "🟢 RODANDO",
-        "Registros": "",
-        "Detalhe": f"Ciclo iniciado às {agora.strftime('%d/%m/%Y %H:%M:%S')}",
-        "Checado em": agora.strftime("%d/%m/%Y %H:%M:%S"),
-    }]
-    with _diagnostico_lock:
-        for fonte, info in sorted(_diagnostico.items()):
-            linhas.append({
-                "Fonte": fonte,
-                "Status": "✅ OK" if info["ok"] else "❌ FALHOU",
-                "Registros": info["registros"],
-                "Detalhe": info["detalhe"],
-                "Checado em": info["hora"].strftime("%d/%m/%Y %H:%M:%S"),
-            })
-    return pd.DataFrame(linhas)
-
 # ==========================================================
 # MONTAR TABELA UNIFICADA
 # ==========================================================
@@ -914,12 +893,8 @@ def exportar_para_sheets(df):
         gc = _obter_cliente_gspread()
         sh = gc.open(GSHEETS_NOME)
 
-        # A aba Diagnóstico é escrita SEMPRE: prova visualmente que o
-        # ciclo rodou (tem timestamp que muda a cada execução).
-        _escrever_aba_com_retry(sh, "Diagnóstico", montar_aba_diagnostico(), pular_dedup=True)
-
         if df.empty:
-            log.warning("Tabela principal vazia; só a aba Diagnóstico foi atualizada neste ciclo.")
+            log.warning("Tabela principal vazia; nada para exportar neste ciclo.")
             return
 
         _escrever_aba_com_retry(sh, "Todas", df)
