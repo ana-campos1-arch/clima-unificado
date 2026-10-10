@@ -762,6 +762,24 @@ def _dados_graficos(df):
 
     return linhas_hora, linhas_dia
 
+# Gráficos extras (hora a hora, hoje): umidade, vento e radiação solar.
+# Dados na aba "Gráficos", colunas U:X (índices 20-23), longe dos gráficos.
+_EXTRAS_NOMES   = ["Umidade (%RH)", "Vento (km/h)", "Radiação Solar (W/m²)"]
+_EXTRAS_COL_INI = 20
+
+def _linhas_hora_extras(df):
+    """[[hora, umidade, vento, radiação], ...] do Open-Meteo horário de hoje."""
+    if df.empty or "Estacao" not in df.columns:
+        return []
+    df_h = df[df["Estacao"] == "Open-Meteo – Hoje (horário)"]
+    if df_h.empty or any(n not in df_h.columns for n in _EXTRAS_NOMES):
+        return []
+    linhas = []
+    for _, r in df_h.sort_values("Hora").iterrows():
+        vals = [pd.to_numeric(r[n], errors="coerce") for n in _EXTRAS_NOMES]
+        linhas.append([str(r["Hora"])[:5]] + [None if pd.isna(v) else float(v) for v in vals])
+    return linhas
+
 def _faixa_grafico(sheet_id, col_ini, col_fim):
     return {
         "sheetId": sheet_id,
@@ -772,7 +790,7 @@ def _faixa_grafico(sheet_id, col_ini, col_fim):
     }
 
 def _spec_grafico_linha(sheet_id, titulo, titulo_x, col_dominio, colunas_series,
-                        linha_ancora, coluna_ancora):
+                        linha_ancora, coluna_ancora, titulo_y="Temperatura (°C)"):
     """Monta a requisição addChart de um gráfico de linha."""
     return {
         "addChart": {
@@ -785,7 +803,7 @@ def _spec_grafico_linha(sheet_id, titulo, titulo_x, col_dominio, colunas_series,
                         "headerCount": 1,
                         "axis": [
                             {"position": "BOTTOM_AXIS", "title": titulo_x},
-                            {"position": "LEFT_AXIS", "title": "Temperatura (°C)"},
+                            {"position": "LEFT_AXIS", "title": titulo_y},
                         ],
                         "domains": [{
                             "domain": {"sourceRange": {"sources": [
@@ -825,6 +843,7 @@ def _atualizar_aba_graficos(sh, df):
     import gspread
 
     linhas_hora, linhas_dia = _dados_graficos(df)
+    linhas_extras = _linhas_hora_extras(df)
     if not linhas_hora and not linhas_dia:
         log.info("Sem dados do Open-Meteo neste ciclo; aba de gráficos não foi atualizada.")
         return
@@ -833,10 +852,19 @@ def _atualizar_aba_graficos(sh, df):
         try:
             ws = sh.worksheet(ABA_GRAFICOS)
         except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=ABA_GRAFICOS, rows=_GRAF_LINHAS_MAX, cols=20)
+            ws = sh.add_worksheet(title=ABA_GRAFICOS, rows=_GRAF_LINHAS_MAX, cols=26)
+        if ws.col_count < 26:
+            ws.resize(cols=26)
 
-        # Limpa só as colunas de dados (A:F), preservando os gráficos.
-        ws.batch_clear([f"A1:F{_GRAF_LINHAS_MAX}"])
+        # Limpa só as colunas de dados (A:F e U:X), preservando os gráficos.
+        ws.batch_clear([f"A1:F{_GRAF_LINHAS_MAX}", f"U1:X{_GRAF_LINHAS_MAX}"])
+
+        if linhas_extras:
+            ws.update(
+                values=[["Hora"] + _EXTRAS_NOMES] + linhas_extras,
+                range_name="U1",
+                value_input_option="USER_ENTERED",
+            )
 
         if linhas_hora:
             ws.update(
@@ -851,20 +879,19 @@ def _atualizar_aba_graficos(sh, df):
                 value_input_option="USER_ENTERED",
             )
 
+        # Títulos dos gráficos que já existem na aba: só criamos os que faltam
+        # (assim planilhas antigas, com 2 gráficos, ganham os novos).
         metadados = sh.fetch_sheet_metadata(
-            params={"fields": "sheets(properties(sheetId,title),charts(chartId))"}
+            params={"fields": "sheets(properties(title),charts(spec(title)))"}
         )
-        ja_tem_grafico = any(
-            aba.get("properties", {}).get("title") == ABA_GRAFICOS and aba.get("charts")
-            for aba in metadados.get("sheets", [])
-        )
-        if ja_tem_grafico:
-            log.info("Aba 'Gráficos' atualizada (gráficos já existentes).")
-            _marcar_diagnostico("Gráficos (aba)", True, len(linhas_hora) + len(linhas_dia),
-                                "dados reescritos")
-            return
+        titulos_existentes = set()
+        for aba in metadados.get("sheets", []):
+            if aba.get("properties", {}).get("title") == ABA_GRAFICOS:
+                for g in aba.get("charts", []):
+                    titulos_existentes.add(g.get("spec", {}).get("title", ""))
 
-        requisicoes = [
+        c0 = _EXTRAS_COL_INI
+        desejados = [
             _spec_grafico_linha(
                 ws.id, "Variação da temperatura hoje (hora a hora) — Open-Meteo",
                 "Hora", col_dominio=0, colunas_series=[1],
@@ -875,11 +902,38 @@ def _atualizar_aba_graficos(sh, df):
                 "Data", col_dominio=3, colunas_series=[4, 5],
                 linha_ancora=19, coluna_ancora=7,
             ),
+            _spec_grafico_linha(
+                ws.id, "Umidade relativa hoje (hora a hora) — Open-Meteo",
+                "Hora", col_dominio=c0, colunas_series=[c0 + 1],
+                linha_ancora=38, coluna_ancora=7, titulo_y="Umidade (%)",
+            ),
+            _spec_grafico_linha(
+                ws.id, "Velocidade do vento hoje (hora a hora) — Open-Meteo",
+                "Hora", col_dominio=c0, colunas_series=[c0 + 2],
+                linha_ancora=57, coluna_ancora=7, titulo_y="Vento (km/h)",
+            ),
+            _spec_grafico_linha(
+                ws.id, "Radiação solar hoje (hora a hora) — Open-Meteo",
+                "Hora", col_dominio=c0, colunas_series=[c0 + 3],
+                linha_ancora=76, coluna_ancora=7, titulo_y="Radiação (W/m²)",
+            ),
         ]
+        if not linhas_extras:
+            desejados = desejados[:2]
+        requisicoes = [
+            r for r in desejados
+            if r["addChart"]["chart"]["spec"]["title"] not in titulos_existentes
+        ]
+        if not requisicoes:
+            log.info("Aba 'Gráficos' atualizada (gráficos já existentes).")
+            _marcar_diagnostico("Gráficos (aba)", True, len(linhas_hora) + len(linhas_dia),
+                                "dados reescritos")
+            return
+
         sh.batch_update({"requests": requisicoes})
-        log.info("Gráficos de temperatura criados na aba 'Gráficos'.")
+        log.info(f"{len(requisicoes)} gráfico(s) criado(s) na aba 'Gráficos'.")
         _marcar_diagnostico("Gráficos (aba)", True, len(linhas_hora) + len(linhas_dia),
-                            "gráficos criados")
+                            f"{len(requisicoes)} gráfico(s) criado(s)")
 
     except Exception as e:
         log.error(f"Erro ao montar a aba de gráficos: {e}")
