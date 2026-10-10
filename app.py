@@ -18,11 +18,15 @@
 #
 # O QUE MUDOU NESTA VERSÃO
 # ─────────────────────────────────────────────────────────
-#  • NOVO: aba "📈 Gráficos" na interface principal (ao lado das abas
+#  • NOVO: gráficos de umidade, vento e radiação solar (hora a hora,
+#    hoje) na aba "📈 Gráficos", desenhados no servidor em SVG puro,
+#    sem chamadas extras a APIs.
+#  • NOVO: coluna "Chuva do dia (mm)" na tabela Open-Meteo – Hoje
+#    (horário), somando a precipitação das horas do dia.
+#  • Aba "📈 Gráficos" na interface principal (ao lado das abas
 #    do Open-Meteo e das demais fontes). Mostra a temperatura de hoje
 #    hora a hora e as máximas/mínimas da semana sem precisar abrir a
-#    tabela. Os gráficos são desenhados no navegador (Chart.js), então
-#    o servidor não monta tabela nem chama o Google Sheets nessa aba.
+#    tabela.
 #  • Aba "Gráficos" na planilha de destino (gráficos nativos do Google
 #    Sheets) continua sendo atualizada normalmente.
 #  • O INMET é coletado pela API de TEMPO REAL (apitempo.inmet.gov.br).
@@ -161,6 +165,8 @@ def coletar_om_horario():
     try:
         dados = sessao_http.get(url, timeout=30).json()
         h = dados["hourly"]
+        # Total de chuva do dia = soma da precipitação de todas as horas
+        chuva_dia = round(sum(v or 0 for v in h["precipitation"]), 1)
         linhas = []
         for i, hora in enumerate(h["time"]):
             linhas.append({
@@ -173,6 +179,7 @@ def coletar_om_horario():
                 "Precip. (mm)":     h["precipitation"][i],
                 "Cód. Clima":       h["weather_code"][i],
                 "Radiação Solar (W/m²)": h["shortwave_radiation"][i],
+                "Chuva do dia (mm)": chuva_dia,
             })
         log.info(f"OK: {len(linhas)} horas do dia de hoje (Open-Meteo)")
         df = pd.DataFrame(linhas)
@@ -1033,18 +1040,21 @@ def _atualizar_historico_inmet():
 # GRÁFICOS SVG (gerados no servidor, sem JavaScript nem CDN)
 # ==========================================================
 
-def _svg_linha(rotulos, series, titulo):
+def _svg_linha(rotulos, series, titulo, unidade="°", unidade_tip="°C", zero_base=False):
     """
     Gráfico de linhas em SVG puro.
     series: lista de (nome, cor, valores[, tracejado]). Valores None
     quebram a linha; séries com nome vazio não aparecem na legenda.
+    unidade/unidade_tip: sufixo dos números do eixo Y e do tooltip.
+    zero_base: força o eixo Y a começar em 0 (vento, radiação).
     """
     import math
     W, H, L, R, T, B = 860, 320, 48, 20, 42, 40
     todos = [v for it in series for v in it[2] if v is not None]
     if not todos:
         return ""
-    ymin, ymax = math.floor(min(todos)) - 1, math.ceil(max(todos)) + 1
+    ymin = 0 if zero_base else math.floor(min(todos)) - 1
+    ymax = math.ceil(max(todos)) + 1
     pw, ph, n = W - L - R, H - T - B, len(rotulos)
 
     def x(i):
@@ -1059,7 +1069,7 @@ def _svg_linha(rotulos, series, titulo):
         v = ymin + (ymax - ymin) * k / 4
         yy = y(v)
         s.append(f'<line x1="{L}" y1="{yy:.1f}" x2="{W-R}" y2="{yy:.1f}" stroke="#e0e0e0"/>')
-        s.append(f'<text x="{L-6}" y="{yy+4:.1f}" text-anchor="end" fill="#666">{v:.0f}°</text>')
+        s.append(f'<text x="{L-6}" y="{yy+4:.1f}" text-anchor="end" fill="#666">{v:.0f}{unidade}</text>')
     passo = max(1, math.ceil(n / 8))
     for i, r in enumerate(rotulos):
         if i % passo == 0:
@@ -1087,7 +1097,7 @@ def _svg_linha(rotulos, series, titulo):
             for i, v in enumerate(vals):
                 if v is not None:
                     s.append(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="3" fill="{cor}">'
-                             f'<title>{rotulos[i]}: {v:.1f}°C</title></circle>')
+                             f'<title>{rotulos[i]}: {v:.1f}{unidade_tip}</title></circle>')
 
     lx = L
     for it in series:
@@ -1145,6 +1155,26 @@ def _graficos_inmet():
         rot_m, series_m, "Temperatura média mensal — INMET") + "</div>"
     return html
 
+# Gráficos hora a hora de hoje (Open-Meteo) além da temperatura:
+# (coluna, título, cor, unidade no eixo, unidade no tooltip, eixo começa em 0)
+GRAFICOS_HORARIOS = [
+    ("Umidade (%RH)",         "Umidade relativa hoje (hora a hora) — Open-Meteo",
+     "#00897B", "%", "%", False),
+    ("Vento (km/h)",          "Velocidade do vento hoje (hora a hora) — Open-Meteo (km/h)",
+     "#6D4C41", "", " km/h", True),
+    ("Radiação Solar (W/m²)", "Radiação solar hoje (hora a hora) — Open-Meteo (W/m²)",
+     "#F9A825", "", " W/m²", True),
+]
+
+def _serie_horaria(df, coluna):
+    """Lista [[hora, valor], ...] de uma coluna do Open-Meteo horário."""
+    df_h = df[df["Estacao"] == "Open-Meteo – Hoje (horário)"]
+    if df_h.empty or coluna not in df_h.columns:
+        return []
+    v = pd.to_numeric(df_h[coluna], errors="coerce")
+    d = df_h.assign(_v=v).dropna(subset=["_v"]).sort_values("Hora")
+    return [[str(h)[:5], float(x)] for h, x in zip(d["Hora"], d["_v"])]
+
 def _html_graficos(df):
     """Conteúdo da aba "📈 Gráficos": Open-Meteo (hoje e semana) + INMET (histórico)."""
     horas, dias = _dados_graficos(df)
@@ -1160,6 +1190,13 @@ def _html_graficos(df):
             [("Máx (°C)", "#E53935", [r[1] for r in dias]),
              ("Mín (°C)", "#1E88E5", [r[2] for r in dias])],
             "Máxima e mínima da semana — Open-Meteo") + "</div>"
+    for coluna, titulo, cor, un, tip, zero in GRAFICOS_HORARIOS:
+        serie = _serie_horaria(df, coluna)
+        if serie:
+            html += '<div class="graf">' + _svg_linha(
+                [r[0] for r in serie],
+                [(coluna, cor, [r[1] for r in serie])],
+                titulo, un, tip, zero) + "</div>"
     if not horas and not dias:
         html += '<div class="msg-vazio">⚠️ Open-Meteo sem dados neste momento (veja o motivo na aba do Open-Meteo).</div>'
     return html + _graficos_inmet()
