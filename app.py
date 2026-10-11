@@ -18,6 +18,12 @@
 #
 # O QUE MUDOU NESTA VERSÃO
 # ─────────────────────────────────────────────────────────
+#  • NOVO: gráfico da chuva de hoje (hora a hora) com o total do dia no
+#    título — aparece mesmo quando o dia está zerado.
+#  • NOVO: gráficos de COMPARAÇÃO dos últimos 30 dias (temperatura, umidade,
+#    vento, chuva e radiação) entre INMET (Cachoeira do Sul), Open-Meteo e
+#    Estação Meteorológica. Cada série entra sozinha quando tem dados.
+#    Open-Meteo: 1 chamada leve a cada 6 h; INMET: o mesmo ZIP diário.
 #  • NOVO: gráficos de umidade, vento e radiação solar (hora a hora,
 #    hoje) na aba "📈 Gráficos", desenhados no servidor em SVG puro,
 #    sem chamadas extras a APIs.
@@ -988,7 +994,7 @@ def atualizar_dados(forcar_inmet=False):
         else:
             log.warning("A atualização não trouxe dados novos; mantendo a tabela anterior.")
 
-    threading.Thread(target=_atualizar_historico_inmet, daemon=True).start()
+    threading.Thread(target=_atualizar_historicos, daemon=True).start()
 
     if GSHEETS_ATIVO:
         with tabela_lock:
@@ -1028,12 +1034,33 @@ app = Flask(__name__)
 # e guarda só a temperatura média de cada dia por estação (resumo pequeno).
 # Não entra na tabela unificada nem no Sheets, então quase não pesa.
 
-_historico_inmet    = {}     # cidade -> DataFrame[data, tmed]
+_historico_inmet    = {}     # cidade -> DataFrame[data, tmed, umid, vento, chuva, rad]
 _historico_hora     = None
 _historico_rodando  = False
 _historico_lock     = threading.Lock()
 
+def _classificar_coluna_inmet(nome):
+    """Diz qual variável do ZIP histórico do INMET é uma coluna (ou None)."""
+    u = str(nome).upper()
+    if u.startswith("DATA"):
+        return "data"
+    if "TEMPERATURA DO AR" in u and "BULBO" in u:
+        return "tmed"
+    if "UMIDADE RELATIVA DO AR" in u:
+        return "umid"
+    if "VENTO" in u and "VELOCIDADE" in u:
+        return "vento"
+    if u.startswith("PRECIPITA"):
+        return "chuva"
+    if u.startswith("RADIA"):
+        return "rad"
+    return None
+
 def _atualizar_historico_inmet():
+    """
+    Guarda, por estação e por dia: temperatura média, umidade média, vento
+    médio (km/h), chuva total (mm) e radiação total (MJ/m²).
+    """
     global _historico_hora, _historico_rodando
     with _historico_lock:
         if _historico_rodando:
@@ -1055,21 +1082,36 @@ def _atualizar_historico_inmet():
                     continue
                 df = pd.read_csv(
                     zf.open(arq), sep=";", encoding="latin1", skiprows=8, decimal=",",
-                    usecols=lambda c: str(c).upper().startswith("DATA")
-                    or ("TEMPERATURA DO AR" in str(c).upper() and "BULBO" in str(c).upper()),
+                    usecols=lambda c: _classificar_coluna_inmet(c) is not None,
                     low_memory=False,
                 )
-                col_d = encontrar_coluna(df.columns, "DATA")
-                col_t = encontrar_coluna(df.columns, "TEMPERATURA DO AR", "BULBO")
-                if col_d is None or col_t is None:
+                cols = {}
+                for c in df.columns:
+                    cols.setdefault(_classificar_coluna_inmet(c), c)
+                if "data" not in cols or "tmed" not in cols:
                     continue
-                t = pd.to_numeric(df[col_t], errors="coerce")
-                t = t.where(t > -100)                      # -9999 = sem medição
-                d = pd.to_datetime(df[col_d], errors="coerce").dt.normalize()
-                g = pd.DataFrame({"data": d, "t": t}).dropna().groupby("data")["t"].agg(["mean", "count"])
-                g = g[g["count"] >= 12]                    # só dias com boa cobertura
-                if not g.empty:
-                    novo[cidade] = pd.DataFrame({"data": g.index, "tmed": g["mean"].values})
+                g = pd.DataFrame({
+                    "data": pd.to_datetime(df[cols["data"]], errors="coerce").dt.normalize()
+                })
+                for k in ("tmed", "umid", "vento", "chuva", "rad"):
+                    if k in cols:
+                        v = pd.to_numeric(df[cols[k]], errors="coerce")
+                        g[k] = v.where(v > -9000)          # -9999 = sem medição
+                g = g.dropna(subset=["data"])
+                grp, cnt = g.groupby("data"), g.groupby("data").count()
+                res = pd.DataFrame(index=cnt.index)
+                res["tmed"] = grp["tmed"].mean().where(cnt["tmed"] >= 12)
+                for k, fator in (("umid", 1.0), ("vento", 3.6)):   # vento: m/s -> km/h
+                    if k in g:
+                        res[k] = (grp[k].mean() * fator).where(cnt[k] >= 12)
+                if "chuva" in g:
+                    res["chuva"] = grp["chuva"].sum(min_count=1).where(cnt["chuva"] >= 12)
+                if "rad" in g:                                     # kJ/m² -> MJ/m²
+                    res["rad"] = (grp["rad"].apply(lambda x: x.clip(lower=0).sum(min_count=1)) / 1000
+                                  ).where(cnt["rad"] >= 12)
+                res = res.dropna(subset=["tmed"]).reset_index()
+                if not res.empty:
+                    novo[cidade] = res
                 break
         if novo:
             with _historico_lock:
@@ -1090,17 +1132,80 @@ def _atualizar_historico_inmet():
         with _historico_lock:
             _historico_rodando = False
 
+# ── Open-Meteo: últimos 30 dias (1 chamada a cada 6 h, resumida por dia) ──
+
+_om_historico      = pd.DataFrame()
+_om_hist_hora      = None
+_om_hist_lock      = threading.Lock()
+
+def _atualizar_om_historico():
+    global _om_historico, _om_hist_hora
+    with _om_hist_lock:
+        if _om_hist_hora and datetime.now() - _om_hist_hora < timedelta(hours=6):
+            return
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={LATITUDE}&longitude={LONGITUDE}"
+        f"&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m,"
+        f"precipitation,shortwave_radiation"
+        f"&past_days=30&forecast_days=1&timezone=America/Sao_Paulo"
+    )
+    try:
+        resp = sessao_http.get(url, timeout=30)
+        resp.raise_for_status()
+        h = resp.json()["hourly"]
+        d = pd.DataFrame({
+            "data":  pd.to_datetime(h["time"]).normalize(),
+            "tmed":  h["temperature_2m"],
+            "umid":  h["relative_humidity_2m"],
+            "vento": h["wind_speed_10m"],
+            "chuva": h["precipitation"],
+            "rad":   h["shortwave_radiation"],
+        })
+        for k in ("tmed", "umid", "vento", "chuva", "rad"):
+            d[k] = pd.to_numeric(d[k], errors="coerce")
+        grp = d.groupby("data")
+        res = pd.DataFrame({
+            "tmed":  grp["tmed"].mean(),
+            "umid":  grp["umid"].mean(),
+            "vento": grp["vento"].mean(),
+            "chuva": grp["chuva"].sum(min_count=1),
+            "rad":   grp["rad"].sum(min_count=1) * 0.0036,     # W/m² por hora -> MJ/m²
+        })
+        with _om_hist_lock:
+            _om_historico = res
+            _om_hist_hora = datetime.now()
+        _marcar_diagnostico("Open-Meteo histórico (30 dias)", True, len(res))
+        log.info(f"OK: Open-Meteo histórico de {len(res)} dias.")
+    except Exception as e:
+        log.error(f"Erro ao buscar Open-Meteo histórico: {e}")
+        _marcar_diagnostico("Open-Meteo histórico (30 dias)", False, 0, str(e))
+        with _om_hist_lock:                                # tenta de novo em ~1 h
+            _om_hist_hora = datetime.now() - timedelta(hours=5)
+
+def _atualizar_historicos():
+    """Roda em segundo plano depois de cada ciclo: Open-Meteo (leve) e INMET (1x/dia)."""
+    try:
+        _atualizar_om_historico()
+    except Exception as e:
+        log.error(f"Erro no histórico do Open-Meteo: {e}")
+    try:
+        _atualizar_historico_inmet()
+    except Exception as e:
+        log.error(f"Erro no histórico do INMET: {e}")
+
 # ==========================================================
 # GRÁFICOS SVG (gerados no servidor, sem JavaScript nem CDN)
 # ==========================================================
 
-def _svg_linha(rotulos, series, titulo, unidade="°", unidade_tip="°C", zero_base=False):
+def _svg_linha(rotulos, series, titulo, unidade="°", unidade_tip="°C", zero_base=False, casas=0):
     """
     Gráfico de linhas em SVG puro.
     series: lista de (nome, cor, valores[, tracejado]). Valores None
     quebram a linha; séries com nome vazio não aparecem na legenda.
     unidade/unidade_tip: sufixo dos números do eixo Y e do tooltip.
-    zero_base: força o eixo Y a começar em 0 (vento, radiação).
+    zero_base: força o eixo Y a começar em 0 (vento, radiação, chuva).
+    casas: casas decimais dos números do eixo Y.
     """
     import math
     W, H, L, R, T, B = 860, 320, 48, 20, 42, 40
@@ -1123,7 +1228,7 @@ def _svg_linha(rotulos, series, titulo, unidade="°", unidade_tip="°C", zero_ba
         v = ymin + (ymax - ymin) * k / 4
         yy = y(v)
         s.append(f'<line x1="{L}" y1="{yy:.1f}" x2="{W-R}" y2="{yy:.1f}" stroke="#e0e0e0"/>')
-        s.append(f'<text x="{L-6}" y="{yy+4:.1f}" text-anchor="end" fill="#666">{v:.0f}{unidade}</text>')
+        s.append(f'<text x="{L-6}" y="{yy+4:.1f}" text-anchor="end" fill="#666">{v:.{casas}f}{unidade}</text>')
     passo = max(1, math.ceil(n / 8))
     for i, r in enumerate(rotulos):
         if i % passo == 0:
@@ -1210,14 +1315,16 @@ def _graficos_inmet():
     return html
 
 # Gráficos hora a hora de hoje (Open-Meteo) além da temperatura:
-# (coluna, título, cor, unidade no eixo, unidade no tooltip, eixo começa em 0)
+# (coluna, título, cor, unidade no eixo, unidade no tooltip, eixo começa em 0, casas)
 GRAFICOS_HORARIOS = [
     ("Umidade (%RH)",         "Umidade relativa hoje (hora a hora) — Open-Meteo",
-     "#00897B", "%", "%", False),
+     "#00897B", "%", "%", False, 0),
     ("Vento (km/h)",          "Velocidade do vento hoje (hora a hora) — Open-Meteo (km/h)",
-     "#6D4C41", "", " km/h", True),
+     "#6D4C41", "", " km/h", True, 0),
     ("Radiação Solar (W/m²)", "Radiação solar hoje (hora a hora) — Open-Meteo (W/m²)",
-     "#F9A825", "", " W/m²", True),
+     "#F9A825", "", " W/m²", True, 0),
+    ("Precip. (mm)",          "Chuva hoje (hora a hora) — Open-Meteo (mm)",
+     "#3949AB", "", " mm", True, 1),
 ]
 
 def _serie_horaria(df, coluna):
@@ -1229,8 +1336,145 @@ def _serie_horaria(df, coluna):
     d = df_h.assign(_v=v).dropna(subset=["_v"]).sort_values("Hora")
     return [[str(h)[:5], float(x)] for h, x in zip(d["Hora"], d["_v"])]
 
+# ── Comparação INMET × Open-Meteo × Estação Meteorológica (últimos 30 dias) ──
+
+INMET_COMPARACAO = "Cachoeira do Sul"     # estação do INMET usada na comparação
+
+# (chave, título, unidade no eixo, unidade no tooltip, eixo começa em 0, casas)
+VARIAVEIS_COMPARACAO = [
+    ("tmed",  "Temperatura média diária (°C)",       "°", "°C",     False, 0),
+    ("umid",  "Umidade relativa média diária (%)",   "%", "%",      False, 0),
+    ("vento", "Velocidade média do vento (km/h)",    "",  " km/h",  True,  0),
+    ("chuva", "Chuva total do dia (mm)",             "",  " mm",    True,  1),
+    ("rad",   "Radiação solar total do dia (MJ/m²)", "",  " MJ/m²", True,  0),
+]
+
+_cache_estacao = {"stamp": None, "df": None}
+
+def _agregar_estacao(e):
+    """
+    Resume por dia as leituras da Estação Meteorológica (1 por minuto).
+    Reconhece as colunas pelo nome (sem acento/maiúscula). Só entram dias
+    com leituras em pelo menos 18 horas diferentes (evita dia parcial).
+    """
+    norm = {c: _normalizar_texto(c) for c in e.columns}
+
+    def achar(tem, sem=()):
+        for c, n in norm.items():
+            if any(t in n for t in tem) and not any(x in n for x in sem):
+                return c
+        return None
+
+    c_data  = achar(("data",))
+    c_hora  = achar(("hora",))
+    c_temp  = achar(("temperatura",), ("bmp", "max", "min", "orvalho"))
+    c_umid  = achar(("umidade",), ("max", "min"))
+    c_vento = achar(("vento",), ("direcao", "rajada"))
+    c_chuva = achar(("precipita", "chuva", "pluv"))
+    c_rad   = achar(("radia",))
+    if c_data is None:
+        return None
+
+    def num(c):
+        return pd.to_numeric(e[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+
+    g = pd.DataFrame({"data": pd.to_datetime(e[c_data].astype(str), dayfirst=True,
+                                              errors="coerce").dt.normalize()})
+    g["h"] = e[c_hora].astype(str).str[:2] if c_hora else "00"
+    if c_temp:
+        t = num(c_temp);  g["tmed"] = t.where((t > -20) & (t < 60))
+    if c_umid:
+        u = num(c_umid);  g["umid"] = u.where((u >= 0) & (u <= 105)).clip(upper=100)
+    if c_vento:
+        v = num(c_vento); v = v.where((v >= 0) & (v < 100))
+        g["vento"] = v * 3.6 if "m/s" in norm[c_vento] else v
+    if c_chuva:
+        r = num(c_chuva); g["chuva"] = r.where((r >= 0) & (r < 50))
+    if c_rad and "w/m" in norm[c_rad]:
+        w = num(c_rad);   g["rad"] = w.where(w >= 0)
+    g = g.dropna(subset=["data"])
+    if g.empty:
+        return None
+
+    grp = g.groupby("data")
+    horas = grp["h"].nunique()
+    res = pd.DataFrame(index=horas.index)
+    for k in ("tmed", "umid", "vento"):
+        if k in g:
+            res[k] = grp[k].mean()
+    if "chuva" in g:
+        res["chuva"] = grp["chuva"].sum(min_count=1)
+    if "rad" in g:
+        res["rad"] = grp["rad"].mean() * 0.0864              # W/m² médio -> MJ/m² no dia
+    res = res[horas >= (18 if c_hora else 1)].dropna(how="all")
+    return res
+
+def _estacao_diaria(df):
+    stamp = (ultima_atualizacao, len(df))
+    if _cache_estacao["stamp"] == stamp:
+        return _cache_estacao["df"]
+    res = None
+    try:
+        e = df[df["Estacao"] == "Estação Meteorológica"].dropna(axis=1, how="all")
+        if not e.empty:
+            res = _agregar_estacao(e)
+    except Exception as ex:
+        log.error(f"Erro ao resumir a Estação Meteorológica: {ex}")
+    _cache_estacao["stamp"], _cache_estacao["df"] = stamp, res
+    return res
+
+def _graficos_comparacao(df):
+    """Um gráfico por variável, com INMET, Open-Meteo e Estação nos últimos 30 dias."""
+    dias = pd.date_range(end=pd.Timestamp(date.today()), periods=30)
+    rot  = [d.strftime("%d/%m") for d in dias]
+
+    with _historico_lock:
+        d_inmet = _historico_inmet.get(INMET_COMPARACAO)
+        inmet = None if d_inmet is None else d_inmet.set_index("data")
+    with _om_hist_lock:
+        om = _om_historico.copy()
+    est = _estacao_diaria(df)
+
+    fontes = [
+        (f"INMET {INMET_COMPARACAO}", "#2E7D32", inmet),
+        ("Open-Meteo",                "#1565C0", om),
+        ("Estação Meteorológica",     "#E65100", est),
+    ]
+
+    html, usados = "", set()
+    for chave, titulo, un, tip, zero, casas in VARIAVEIS_COMPARACAO:
+        series = []
+        for nome, cor, d in fontes:
+            if d is None or d.empty or chave not in d.columns:
+                continue
+            vals = [None if pd.isna(v) else float(v) for v in d[chave].reindex(dias)]
+            if any(v is not None for v in vals):
+                series.append((nome, cor, vals))
+                usados.add(nome)
+        if series:
+            html += '<div class="graf">' + _svg_linha(
+                rot, series, f"{titulo} — últimos 30 dias", un, tip, zero, casas) + "</div>"
+
+    notas = []
+    for nome, _, d in fontes:
+        if nome not in usados:
+            notas.append(f"<strong>{nome}</strong>: sem dados nos últimos 30 dias "
+                         f"(entra no gráfico automaticamente quando houver)")
+    if est is not None and not est.empty:
+        n_dias = int(est.reindex(dias).notna().any(axis=1).sum())
+        notas.append(f"<strong>Estação Meteorológica</strong>: {n_dias} de 30 dias com dados "
+                     f"(só dias com leituras em 18 h ou mais)")
+    notas.append("INMET vem do histórico oficial e costuma ter 1–3 semanas de atraso")
+
+    cabecalho = ('<h2 class="sec">📊 Comparação — INMET × Open-Meteo × Estação Meteorológica</h2>'
+                 '<p class="resumo">' + " &nbsp;|&nbsp; ".join(notas) + "</p>")
+    if not html:
+        return cabecalho + ('<div class="msg-vazio">⏳ Dados de comparação ainda carregando '
+                            '(histórico é buscado em segundo plano). Atualize a página em instantes.</div>')
+    return cabecalho + html
+
 def _html_graficos(df):
-    """Conteúdo da aba "📈 Gráficos": Open-Meteo (hoje e semana) + INMET (histórico)."""
+    """Conteúdo da aba "📈 Gráficos": Open-Meteo (hoje/semana), comparação de 30 dias e INMET histórico."""
     horas, dias = _dados_graficos(df)
     html = ""
     if horas:
@@ -1244,16 +1488,18 @@ def _html_graficos(df):
             [("Máx (°C)", "#E53935", [r[1] for r in dias]),
              ("Mín (°C)", "#1E88E5", [r[2] for r in dias])],
             "Máxima e mínima da semana — Open-Meteo") + "</div>"
-    for coluna, titulo, cor, un, tip, zero in GRAFICOS_HORARIOS:
+    for coluna, titulo, cor, un, tip, zero, casas in GRAFICOS_HORARIOS:
         serie = _serie_horaria(df, coluna)
         if serie:
+            if coluna == "Precip. (mm)":      # mostra o total do dia, mesmo que seja 0
+                titulo += f" — total do dia: {sum(r[1] for r in serie):.1f} mm".replace(".", ",")
             html += '<div class="graf">' + _svg_linha(
                 [r[0] for r in serie],
                 [(coluna, cor, [r[1] for r in serie])],
-                titulo, un, tip, zero) + "</div>"
+                titulo, un, tip, zero, casas) + "</div>"
     if not horas and not dias:
         html += '<div class="msg-vazio">⚠️ Open-Meteo sem dados neste momento (veja o motivo na aba do Open-Meteo).</div>'
-    return html + _graficos_inmet()
+    return html + _graficos_comparacao(df) + _graficos_inmet()
 
 @app.route("/")
 def inicio():
@@ -1375,6 +1621,7 @@ def inicio():
         .src-comunidade     {{ background: #D1C4E9; color: #4527A0; }}
 
         .msg-vazio {{ background: #FFF3E0; border: 1px solid #FFCC80; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: #E65100; max-width: 900px; }}
+        .sec {{ color: #1565C0; font-size: 17px; margin: 22px 0 6px; max-width: 900px; }}
         .resumo {{ font-size: 12px; color: #333; max-width: 900px; margin: -6px 0 16px; }}
         .graf {{ background: white; border-radius: 8px; padding: 12px; margin-bottom: 16px; max-width: 900px; }}
 
