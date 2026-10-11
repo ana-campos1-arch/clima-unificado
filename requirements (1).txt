@@ -1,0 +1,7 @@
+flask
+pandas
+numpy
+requests
+gspread
+google-auth
+reportlab
