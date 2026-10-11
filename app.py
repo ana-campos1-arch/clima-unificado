@@ -17,23 +17,22 @@
 #     ambiente no Render (ou deixe os valores padrão abaixo)
 #
 # requirements.txt: flask, pandas, numpy, requests, gspread,
-#                   google-auth, reportlab   <-- reportlab é NOVO (PDF)
+#                   google-auth, reportlab
 #
 # O QUE MUDOU NESTA VERSÃO
 # ─────────────────────────────────────────────────────────
-#  • NOVO: botão "Baixar PDF dos gráficos" (rota /graficos.pdf), com todos
-#    os gráficos do site. PDF desenhado no servidor com reportlab (sem
-#    navegador, sem imagens temporárias) e guardado em cache até os dados
-#    mudarem.
-#  • NOVO: gráficos de comparação HOJE, hora a hora, Open-Meteo × Estação
-#    Meteorológica (temperatura, umidade, vento, chuva e radiação).
-#  • UNIFICADO: existe UMA lista de gráficos (_montar_graficos), montada uma
-#    vez por ciclo e guardada em cache. O site, o PDF e a aba "Gráficos" do
-#    Google Sheets leem a mesma lista — todos os gráficos aparecem nos três
-#    lugares, sem recalcular nada três vezes.
-#  • Aba "Gráficos" da planilha agora tem TODOS os gráficos nativos (antes só
-#    tinha 5). Os dados ficam à direita (coluna AD em diante); os gráficos,
-#    à esquerda. Se a aba tiver o layout antigo, ela é recriada uma vez.
+#  • NOVO: nos gráficos que comparam várias séries (INMET × Open-Meteo ×
+#    Estação, as 3 cidades do INMET, hoje hora a hora), cada série agora tem
+#    cor + estilo de linha + formato de marcador próprios (círculo contínuo,
+#    quadrado traço-ponto, triângulo pontilhado). Vale para site, PDF e
+#    gráficos nativos do Google Sheets. Gráficos de uma série só ficam como
+#    estavam. Só visual: nenhuma coleta/API muda.
+#  • A aba "Gráficos" do Sheets usa a marca "layout-v4": é recriada uma única
+#    vez no próximo ciclo para aplicar os novos estilos.
+#  • Botão "Baixar PDF dos gráficos" (rota /graficos.pdf), desenhado no
+#    servidor com reportlab e guardado em cache até os dados mudarem.
+#  • Gráficos de comparação HOJE, hora a hora, Open-Meteo × Estação.
+#  • UMA lista de gráficos (_montar_graficos) alimenta site, PDF e Sheets.
 #  • Mantido: INMET pela API de tempo real (ZIP anual só como reserva),
 #    retries com backoff, Sheets só reescreve aba que mudou, /status.
 # ==========================================================
@@ -986,20 +985,15 @@ def _estacao_resumos(df):
 # número de linhas); só os valores mudam. Isso mantém fixo o layout da aba
 # "Gráficos" no Sheets, onde cada gráfico nativo é criado uma única vez.
 
-SEC_OM    = "Open-Meteo — próximos dias"
-SEC_HOJE  = "Hoje, hora a hora — Open-Meteo e Estação Meteorológica"
-SEC_COMP  = "Últimos 30 dias — INMET, Open-Meteo e Estação Meteorológica"
-SEC_INMET = "INMET — histórico de cada estação"
+SEC_OM    = "Open-Meteo — hoje e próximos dias"
+SEC_HOJE  = "Hoje, hora a hora — Open-Meteo × Estação Meteorológica"
+SEC_COMP  = "Últimos 30 dias — INMET × Open-Meteo × Estação Meteorológica"
+SEC_INMET = "INMET — histórico das estações"
 ORDEM_SECOES = [SEC_OM, SEC_HOJE, SEC_COMP, SEC_INMET]
 
 INMET_COMPARACAO = "Cachoeira do Sul"     # estação do INMET usada na comparação de 30 dias
 
 _HORAS = [f"{h:02d}:00" for h in range(24)]
-
-# Cada fonte tem sempre a MESMA cor, em todos os gráficos
-COR_OM    = "#1565C0"      # Open-Meteo: azul
-COR_EST   = "#E65100"      # Estação Meteorológica: laranja
-COR_INMET = "#2E7D32"      # INMET: verde
 
 _CORES_INMET = {
     "Cachoeira do Sul":         "#2E7D32",
@@ -1007,20 +1001,30 @@ _CORES_INMET = {
     "Santa Maria Convencional": "#AD1457",
 }
 
-NOTA_ESCALA = ("Cada fonte tem o seu próprio gráfico, todos com a mesma escala no eixo vertical "
-               "para facilitar a comparação")
-
-# Hoje, hora a hora: um gráfico do Open-Meteo e um da Estação para cada variável
-# (coluna Open-Meteo, chave da estação, título, un, tip, zero, casas, título Y)
-COMPARACAO_HOJE = [
-    ("Temperatura (°C)",      "tmed",  "Temperatura hoje",       "°", "°C",    False, 0, "Temperatura (°C)"),
-    ("Umidade (%RH)",         "umid",  "Umidade hoje",           "%", "%",     False, 0, "Umidade (%)"),
-    ("Vento (km/h)",          "vento", "Vento hoje",             "",  " km/h", True,  0, "Vento (km/h)"),
-    ("Precip. (mm)",          "chuva", "Chuva hoje (por hora)",  "",  " mm",   True,  1, "Chuva (mm)"),
-    ("Radiação Solar (W/m²)", "rad",   "Radiação solar hoje",    "",  " W/m²", True,  0, "Radiação (W/m²)"),
+# Gráficos hora a hora de hoje (Open-Meteo) além da temperatura:
+# (id, coluna, título, cor, unidade eixo, unidade tooltip, eixo em 0, casas, título Y)
+GRAFICOS_HORARIOS = [
+    ("om_umid",  "Umidade (%RH)",         "Umidade relativa hoje (hora a hora) — Open-Meteo",
+     "#00897B", "%", "%", False, 0, "Umidade (%)"),
+    ("om_vento", "Vento (km/h)",          "Velocidade do vento hoje (hora a hora) — Open-Meteo",
+     "#6D4C41", "", " km/h", True, 0, "Vento (km/h)"),
+    ("om_rad",   "Radiação Solar (W/m²)", "Radiação solar hoje (hora a hora) — Open-Meteo",
+     "#F9A825", "", " W/m²", True, 0, "Radiação (W/m²)"),
+    ("om_chuva", "Precip. (mm)",          "Chuva hoje (hora a hora) — Open-Meteo",
+     "#3949AB", "", " mm", True, 1, "Chuva (mm)"),
 ]
 
-# Últimos 30 dias (resumo diário): um gráfico por fonte para cada variável
+# Comparação de HOJE, hora a hora: Open-Meteo × Estação Meteorológica
+# (coluna Open-Meteo, chave da estação, título, un, tip, zero, casas, título Y)
+COMPARACAO_HOJE = [
+    ("Temperatura (°C)",      "tmed",  "Temperatura hoje: Open-Meteo × Estação",     "°", "°C",    False, 0, "Temperatura (°C)"),
+    ("Umidade (%RH)",         "umid",  "Umidade hoje: Open-Meteo × Estação",         "%", "%",     False, 0, "Umidade (%)"),
+    ("Vento (km/h)",          "vento", "Vento hoje: Open-Meteo × Estação",           "",  " km/h", True,  0, "Vento (km/h)"),
+    ("Precip. (mm)",          "chuva", "Chuva hoje (por hora): Open-Meteo × Estação","",  " mm",   True,  1, "Chuva (mm)"),
+    ("Radiação Solar (W/m²)", "rad",   "Radiação hoje: Open-Meteo × Estação",        "",  " W/m²", True,  0, "Radiação (W/m²)"),
+]
+
+# Comparação dos últimos 30 dias (resumo diário)
 # (chave, título, unidade no eixo, unidade no tooltip, eixo em 0, casas, título Y)
 VARIAVEIS_COMPARACAO = [
     ("tmed",  "Temperatura média diária",       "°", "°C",     False, 0, "Temperatura (°C)"),
@@ -1063,82 +1067,59 @@ def _serie_horaria(df, coluna):
     return [[str(h)[:5], float(x)] for h, x in zip(d["Hora"], d["_v"])]
 
 def _g(id_, secao, titulo, rot, series, un="", tip="", zero=False, casas=0,
-       ty="", tx="Hora", sufixo="", linha=0, grupo=None):
+       ty="", tx="Hora", sufixo=""):
     return {"id": id_, "secao": secao, "titulo": titulo, "sufixo": sufixo,
             "rotulos": rot, "series": series, "un": un, "tip": tip,
-            "zero": zero, "casas": casas, "ty": ty, "tx": tx,
-            "linha": linha, "grupo": grupo}
-
-def _fixar_escalas(graficos):
-    """Gráficos do mesmo grupo (mesma variável, fontes diferentes) usam o mesmo eixo Y."""
-    grupos = {}
-    for g in graficos:
-        if g["grupo"]:
-            grupos.setdefault(g["grupo"], []).append(g)
-    for membros in grupos.values():
-        todos = [v for g in membros for s in g["series"] for v in s[2] if v is not None]
-        if not todos:
-            continue
-        ymin = 0 if membros[0]["zero"] else math.floor(min(todos)) - 1
-        ymax = math.ceil(max(todos)) + 1
-        for g in membros:
-            g["ylim"] = (ymin, ymax)
-
-def _posicionar(graficos):
-    """Coluna de cada gráfico dentro da sua linha (usada pelo site, pelo PDF e pelo Sheets)."""
-    cont = {}
-    for g in graficos:
-        g["coluna"] = cont.get(g["linha"], 0)
-        cont[g["linha"]] = g["coluna"] + 1
+            "zero": zero, "casas": casas, "ty": ty, "tx": tx}
 
 def _montar_graficos(df):
     """Monta TODOS os gráficos. Devolve {"graficos": [...], "notas": {seção: [html]}}."""
     import numpy as np
 
     graficos, notas = [], {s: [] for s in ORDEM_SECOES}
-    contador = [0]
-
-    def nova_linha():
-        contador[0] += 1
-        return contador[0]
 
     def v24(mapa):
         return [mapa.get(h) for h in _HORAS]
 
-    # ── 1. Open-Meteo: máxima e mínima da semana ───────────────────
-    _, dias = _dados_graficos(df)
+    # ── 1. Open-Meteo: hoje e semana ───────────────────────────────
+    horas, dias = _dados_graficos(df)
+    graficos.append(_g(
+        "om_temp_hoje", SEC_OM, "Temperatura hoje (hora a hora) — Open-Meteo", _HORAS,
+        [("Temperatura (°C)", "#1565C0", v24(dict(horas)))], "°", "°C", False, 0, "Temperatura (°C)"))
+
     falta = 7 - len(dias)
     graficos.append(_g(
         "om_semana", SEC_OM, "Máxima e mínima da semana — Open-Meteo",
         [r[0][5:] for r in dias] + [""] * falta,
         [("Máx (°C)", "#E53935", [r[1] for r in dias] + [None] * falta),
          ("Mín (°C)", "#1E88E5", [r[2] for r in dias] + [None] * falta)],
-        "°", "°C", False, 0, "Temperatura (°C)", tx="Data", linha=nova_linha()))
+        "°", "°C", False, 0, "Temperatura (°C)", tx="Data"))
 
-    # ── 2. Hoje, hora a hora: cada fonte no seu gráfico ────────────
+    for id_, coluna, titulo, cor, un, tip, zero, casas, ty in GRAFICOS_HORARIOS:
+        mapa = dict(_serie_horaria(df, coluna))
+        sufixo = ""
+        if coluna == "Precip. (mm)" and mapa:   # total do dia, mesmo que seja 0
+            sufixo = f" — total do dia: {sum(mapa.values()):.1f} mm".replace(".", ",")
+        graficos.append(_g(id_, SEC_OM, titulo, _HORAS, [(coluna, cor, v24(mapa))],
+                           un, tip, zero, casas, ty, sufixo=sufixo))
+
+    # ── 2. Hoje, hora a hora: Open-Meteo × Estação ────────────────
     est_dia, est_hora = _estacao_resumos(df)
-    for col_om, chave, base, un, tip, zero, casas, ty in COMPARACAO_HOJE:
-        ln = nova_linha()
+    for col_om, chave, titulo, un, tip, zero, casas, ty in COMPARACAO_HOJE:
         mapa_om = dict(_serie_horaria(df, col_om))
-        for nome, cor, mapa, sigla in (("Open-Meteo", COR_OM, mapa_om, "om"),
-                                       ("Estação Meteorológica", COR_EST,
-                                        est_hora.get(chave, {}), "est")):
-            sufixo = ""
-            if chave == "chuva" and mapa:               # total do dia, mesmo que seja 0
-                sufixo = f" — total: {sum(mapa.values()):.1f} mm".replace(".", ",")
-            graficos.append(_g(
-                f"hoje_{chave}_{sigla}", SEC_HOJE, f"{base} — {nome}", _HORAS,
-                [(nome, cor, v24(mapa))], un, tip, zero, casas, ty,
-                sufixo=sufixo, linha=ln, grupo=f"hoje_{chave}"))
-    notas[SEC_HOJE].append(NOTA_ESCALA)
+        graficos.append(_g(
+            f"hoje_{chave}", SEC_HOJE, titulo, _HORAS,
+            [("Open-Meteo", "#1565C0", v24(mapa_om)),
+             ("Estação Meteorológica", "#E65100", v24(est_hora.get(chave, {})))],
+            un, tip, zero, casas, ty))
     if not est_hora:
         notas[SEC_HOJE].append("<strong>Estação Meteorológica</strong>: sem leituras de hoje "
-                               "(o gráfico aparece sozinho quando houver dados)")
+                               "(a linha entra sozinha quando houver dados)")
     else:
         notas[SEC_HOJE].append("Estação: média por hora das leituras (chuva = soma da hora); "
                                "Open-Meteo: valor horário do modelo")
 
-    # ── 3. Últimos 30 dias: cada fonte no seu gráfico ──────────────
+    # ── 3. Últimos 30 dias: INMET × Open-Meteo × Estação ──────────
     dias30 = pd.date_range(end=pd.Timestamp(date.today()), periods=30)
     rot30  = [d.strftime("%d/%m") for d in dias30]
     with _historico_lock:
@@ -1147,84 +1128,75 @@ def _montar_graficos(df):
     with _om_hist_lock:
         om = _om_historico.copy()
     fontes = [
-        (f"INMET {INMET_COMPARACAO}", COR_INMET, inmet),
-        ("Open-Meteo",                COR_OM,    om),
-        ("Estação Meteorológica",     COR_EST,   est_dia),
+        (f"INMET {INMET_COMPARACAO}", "#2E7D32", inmet),
+        ("Open-Meteo",                "#1565C0", om),
+        ("Estação Meteorológica",     "#E65100", est_dia),
     ]
     usados = set()
     for chave, titulo, un, tip, zero, casas, ty in VARIAVEIS_COMPARACAO:
-        ln = nova_linha()
-        for k, (nome, cor, d) in enumerate(fontes):
+        series = []
+        for nome, cor, d in fontes:
             if d is None or d.empty or chave not in d.columns:
                 vals = [None] * 30
             else:
                 vals = [None if pd.isna(v) else float(v) for v in d[chave].reindex(dias30)]
             if any(v is not None for v in vals):
                 usados.add(nome)
-            graficos.append(_g(
-                f"comp30_{chave}_{k}", SEC_COMP, f"{titulo} — {nome}", rot30,
-                [(nome, cor, vals)], un, tip, zero, casas, ty, tx="Dia",
-                linha=ln, grupo=f"comp30_{chave}"))
-    notas[SEC_COMP].append(NOTA_ESCALA)
+            series.append((nome, cor, vals))
+        graficos.append(_g(f"comp30_{chave}", SEC_COMP, f"{titulo} — últimos 30 dias", rot30,
+                           series, un, tip, zero, casas, ty, tx="Dia"))
     for nome, _, _d in fontes:
         if nome not in usados:
             notas[SEC_COMP].append(f"<strong>{nome}</strong>: sem dados nos últimos 30 dias "
-                                   f"(o gráfico aparece sozinho quando houver dados)")
+                                   f"(entra no gráfico automaticamente quando houver)")
     if est_dia is not None and not est_dia.empty:
         n_dias = int(est_dia.reindex(dias30).notna().any(axis=1).sum())
         notas[SEC_COMP].append(f"<strong>Estação Meteorológica</strong>: {n_dias} de 30 dias com dados "
                                f"(só dias com leituras em 18 h ou mais)")
     notas[SEC_COMP].append("INMET vem do histórico oficial e costuma ter 1–3 semanas de atraso")
 
-    # ── 4. INMET: 60 dias com tendência + média mensal (um por estação) ──
+    # ── 4. INMET: 60 dias com tendência + média mensal ────────────
     with _historico_lock:
         dados = {c: d.copy() for c, d in _historico_inmet.items()}
     ultimo = max((d["data"].max() for d in dados.values()), default=pd.Timestamp(date.today()))
     dias60 = pd.date_range(ultimo - pd.Timedelta(days=59), ultimo)
     rot60  = [d.strftime("%d/%m") for d in dias60]
-    ln, resumo = nova_linha(), []
-    for k, cidade in enumerate(ESTACOES.values()):
+    series, tendencias, resumo = [], [], []
+    for cidade in ESTACOES.values():
         cor = _CORES_INMET.get(cidade, "#555")
         d = dados.get(cidade)
-        series = []
         if d is None:
             series.append((cidade, cor, [None] * 60))
-        else:
-            vals = [None if pd.isna(v) else float(v) for v in d.set_index("data")["tmed"].reindex(dias60)]
-            series.append((cidade, cor, vals))
-            idx = [i for i, v in enumerate(vals) if v is not None]
-            if len(idx) >= 3:
-                a, b = np.polyfit(idx, [vals[i] for i in idx], 1)
-                series.append(("", cor, [a * i + b for i in range(len(vals))], True))
-                media = float(np.mean([vals[i] for i in idx]))
-                resumo.append(f"<strong>{cidade}</strong>: média {media:.1f}°C, tendência {a:+.2f}°C/dia")
-        graficos.append(_g(
-            f"inmet_60d_{k}", SEC_INMET, f"Temp. média diária (60 dias) — {cidade}", rot60,
-            series, "°", "°C", False, 0, "Temperatura (°C)", tx="Dia",
-            sufixo=" — tracejado = tendência", linha=ln, grupo="inmet_60d"))
-    notas[SEC_INMET].append(NOTA_ESCALA)
+            continue
+        vals = [None if pd.isna(v) else float(v) for v in d.set_index("data")["tmed"].reindex(dias60)]
+        series.append((cidade, cor, vals))
+        idx = [i for i, v in enumerate(vals) if v is not None]
+        if len(idx) >= 3:
+            a, b = np.polyfit(idx, [vals[i] for i in idx], 1)
+            tendencias.append(("", cor, [a * i + b for i in range(len(vals))], True))
+            media = float(np.mean([vals[i] for i in idx]))
+            resumo.append(f"<strong>{cidade}</strong>: média {media:.1f}°C, tendência {a:+.2f}°C/dia")
+    graficos.append(_g("inmet_60d", SEC_INMET, "Temperatura média diária — INMET (60 dias)", rot60,
+                       series + tendencias, "°", "°C", False, 0, "Temperatura (°C)", tx="Dia",
+                       sufixo=", tracejado = tendência"))
     if resumo:
         notas[SEC_INMET].append(" &nbsp;|&nbsp; ".join(resumo).replace(".", ","))
 
     ano = int(ultimo.year)
     meses = [pd.Period(f"{ano}-{k:02d}", "M") for k in range(1, 13)]
-    rot_m = [f"{k:02d}/{str(ano)[2:]}" for k in range(1, 13)]
-    ln = nova_linha()
-    for k, cidade in enumerate(ESTACOES.values()):
-        cor = _CORES_INMET.get(cidade, "#555")
+    series_m = []
+    for cidade in ESTACOES.values():
         d = dados.get(cidade)
         if d is None:
-            vals_m = [None] * 12
-        else:
-            m = d.groupby(d["data"].dt.to_period("M"))["tmed"].mean()
-            vals_m = [float(m[p]) if p in m.index else None for p in meses]
-        graficos.append(_g(
-            f"inmet_mensal_{k}", SEC_INMET, f"Temp. média mensal — {cidade}", rot_m,
-            [(cidade, cor, vals_m)], "°", "°C", False, 0, "Temperatura (°C)", tx="Mês",
-            linha=ln, grupo="inmet_mensal"))
+            series_m.append((cidade, _CORES_INMET.get(cidade, "#555"), [None] * 12))
+            continue
+        m = d.groupby(d["data"].dt.to_period("M"))["tmed"].mean()
+        series_m.append((cidade, _CORES_INMET.get(cidade, "#555"),
+                         [float(m[p]) if p in m.index else None for p in meses]))
+    graficos.append(_g("inmet_mensal", SEC_INMET, "Temperatura média mensal — INMET",
+                       [f"{k:02d}/{str(ano)[2:]}" for k in range(1, 13)], series_m,
+                       "°", "°C", False, 0, "Temperatura (°C)", tx="Mês"))
 
-    _fixar_escalas(graficos)
-    _posicionar(graficos)
     return {"graficos": graficos, "notas": notas}
 
 _cache_graficos = {"stamp": None, "dados": None}
@@ -1245,7 +1217,7 @@ def obter_graficos(df):
 # GRÁFICOS — preparo comum (site e PDF)
 # ==========================================================
 
-_DIM = (560, 300, 46, 16, 40, 40)       # W, H, L, R, T, B
+_DIM = (860, 320, 48, 20, 42, 40)       # W, H, L, R, T, B
 
 def _titulo_completo(g):
     return g["titulo"] + g.get("sufixo", "")
@@ -1269,14 +1241,34 @@ def _preparar_grafico(g):
     series = [tuple(s[:2]) + (s[2][a:b],) + tuple(s[3:]) for s in series]
     return rot, series
 
-def _eixo_y(series, zero, ylim=None):
-    """Limites do eixo Y. Se o gráfico pertence a um grupo de comparação, usa a escala do grupo."""
-    if ylim:
-        return ylim
+def _eixo_y(series, zero):
     todos = [v for it in series for v in it[2] if v is not None]
     ymin = 0 if zero else math.floor(min(todos)) - 1
     ymax = math.ceil(max(todos)) + 1
     return ymin, ymax
+
+# ── Estilos para diferenciar séries em gráficos de comparação ──────
+# (tracejado SVG/PDF, formato do marcador)
+_ESTILOS = [("", "circle"), ("9 3 2 3", "square"), ("2 4", "triangle")]
+# (tipo de linha, formato do ponto) no Google Sheets
+_SHEETS_ESTILOS = [("SOLID", "CIRCLE"), ("LONG_DASHED_DOTTED", "SQUARE"), ("DOTTED", "TRIANGLE")]
+
+def _estilo_serie(series, it):
+    """Estilo da série; só diferencia quando há 2+ séries (comparação)."""
+    base = [s for s in series if not _eh_tracejada(s)]
+    if len(base) < 2 or _eh_tracejada(it):
+        return _ESTILOS[0]
+    k = next(i for i, s in enumerate(base) if s is it)
+    return _ESTILOS[k % len(_ESTILOS)]
+
+def _marcador_svg(forma, cx, cy, cor, tip):
+    t = f"<title>{tip}</title>"
+    if forma == "square":
+        return f'<rect x="{cx-3:.1f}" y="{cy-3:.1f}" width="6" height="6" fill="{cor}">{t}</rect>'
+    if forma == "triangle":
+        return (f'<polygon points="{cx:.1f},{cy-4:.1f} {cx-4:.1f},{cy+3:.1f} {cx+4:.1f},{cy+3:.1f}" '
+                f'fill="{cor}">{t}</polygon>')
+    return f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="3" fill="{cor}">{t}</circle>'
 
 def _segmentos(vals):
     segs, atual = [], []
@@ -1298,9 +1290,9 @@ def _svg_linha(g):
         return ""
     rotulos, series = prep
     W, H, L, R, T, B = _DIM
-    ymin, ymax = _eixo_y(series, g["zero"], g.get("ylim"))
+    ymin, ymax = _eixo_y(series, g["zero"])
     pw, ph, n = W - L - R, H - T - B, len(rotulos)
-    un, casas = g["un"], g["casas"]
+    un, tip, casas = g["un"], g["tip"], g["casas"]
 
     def x(i):
         return L + (pw / 2 if n == 1 else i * pw / (n - 1))
@@ -1309,37 +1301,44 @@ def _svg_linha(g):
         return T + ph - (v - ymin) / (ymax - ymin) * ph
 
     s = [f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" font-family="Arial" font-size="11">',
-         f'<text x="{W/2}" y="22" text-anchor="middle" font-size="13" font-weight="bold" fill="#333">'
+         f'<text x="{W/2}" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#333">'
          f'{_titulo_completo(g)}</text>']
     for k in range(5):
         v = ymin + (ymax - ymin) * k / 4
         yy = y(v)
         s.append(f'<line x1="{L}" y1="{yy:.1f}" x2="{W-R}" y2="{yy:.1f}" stroke="#e0e0e0"/>')
         s.append(f'<text x="{L-6}" y="{yy+4:.1f}" text-anchor="end" fill="#666">{v:.{casas}f}{un}</text>')
-    passo = max(1, math.ceil(n / 6))
+    passo = max(1, math.ceil(n / 8))
     for i, r in enumerate(rotulos):
         if i % passo == 0:
             s.append(f'<text x="{x(i):.1f}" y="{H-B+16}" text-anchor="middle" fill="#666">{r}</text>')
 
     for it in series:
         cor, vals, trac = it[1], it[2], _eh_tracejada(it)
+        dash, forma = _estilo_serie(series, it)
         for sg in _segmentos(vals):
             pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in sg)
-            extra = ' stroke-dasharray="6 4"' if trac else ""
+            if trac:
+                extra = ' stroke-dasharray="6 4"'
+            else:
+                extra = f' stroke-dasharray="{dash}"' if dash else ""
             s.append(f'<polyline points="{pts}" fill="none" stroke="{cor}" '
                      f'stroke-width="{1.8 if trac else 2.5}"{extra}/>')
         if not trac:
             for i, v in enumerate(vals):
                 if v is not None:
-                    s.append(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="2.5" fill="{cor}">'
-                             f'<title>{rotulos[i]}: {v:.{max(casas, 1)}f}{g["tip"]}</title></circle>')
+                    s.append(_marcador_svg(forma, x(i), y(v), cor,
+                                           f'{rotulos[i]}: {v:.{max(casas, 1)}f}{tip}'))
 
     lx = L
     for it in series:
         if it[0]:
-            s.append(f'<rect x="{lx}" y="{H-14}" width="12" height="4" fill="{it[1]}"/>'
-                     f'<text x="{lx+16}" y="{H-9}" fill="#333">{it[0]}</text>')
-            lx += 40 + 7 * len(it[0])
+            dash, _f = _estilo_serie(series, it)
+            da = f' stroke-dasharray="{dash}"' if dash else ""
+            s.append(f'<line x1="{lx}" y1="{H-12}" x2="{lx+22}" y2="{H-12}" '
+                     f'stroke="{it[1]}" stroke-width="2.5"{da}/>'
+                     f'<text x="{lx+27}" y="{H-9}" fill="#333">{it[0]}</text>')
+            lx += 50 + 7 * len(it[0])
     s.append("</svg>")
     return "".join(s)
 
@@ -1354,8 +1353,8 @@ ABA_GRAFICOS        = "Gráficos"
 _GRAF_MARCA         = "layout-v4"
 _GRAF_MARCA_COL     = 29            # coluna AD (índice 0-based)
 _GRAF_COL_INI       = 30            # coluna AE: primeiro bloco de dados
-_GRAF_PASSO_LINHAS  = 16            # altura de cada gráfico, em linhas
-_GRAF_PASSO_COLUNAS = 7             # largura de cada gráfico, em colunas
+_GRAF_PASSO_LINHAS  = 18            # altura de cada gráfico, em linhas
+_GRAF_PASSO_COLUNAS = 8             # segundo gráfico da linha começa na coluna 8
 
 def _layout_sheets(graficos):
     """[(gráfico, coluna_dos_rótulos, séries_sem_tracejado)], coluna_final."""
@@ -1370,7 +1369,11 @@ def _faixa_grafico(sheet_id, col_ini, col_fim, linhas):
     return {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": linhas,
             "startColumnIndex": col_ini, "endColumnIndex": col_fim}
 
-def _spec_grafico_linha(sheet_id, g, col, nsers, posicao=None):
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return {"red": int(h[0:2], 16) / 255, "green": int(h[2:4], 16) / 255, "blue": int(h[4:6], 16) / 255}
+
+def _spec_grafico_linha(sheet_id, g, col, sers, posicao):
     """Requisição addChart de um gráfico de linha nativo."""
     linhas = len(g["rotulos"]) + 1
     return {
@@ -1391,19 +1394,23 @@ def _spec_grafico_linha(sheet_id, g, col, nsers, posicao=None):
                         "series": [
                             {"series": {"sourceRange": {"sources": [
                                 _faixa_grafico(sheet_id, col + 1 + j, col + 2 + j, linhas)]}},
-                             "targetAxis": "LEFT_AXIS"}
-                            for j in range(nsers)
+                             "targetAxis": "LEFT_AXIS",
+                             "color": _hex_rgb(s[1]),
+                             **({"lineStyle": {"type": _SHEETS_ESTILOS[j % 3][0], "width": 3},
+                                 "pointStyle": {"shape": _SHEETS_ESTILOS[j % 3][1], "size": 6}}
+                                if len(sers) > 1 else {})}
+                            for j, s in enumerate(sers)
                         ],
                     },
                 },
                 "position": {"overlayPosition": {
                     "anchorCell": {
                         "sheetId": sheet_id,
-                        "rowIndex": (g["linha"] - 1) * _GRAF_PASSO_LINHAS,
-                        "columnIndex": g["coluna"] * _GRAF_PASSO_COLUNAS,
+                        "rowIndex": (posicao // 2) * _GRAF_PASSO_LINHAS,
+                        "columnIndex": (posicao % 2) * _GRAF_PASSO_COLUNAS,
                     },
-                    "widthPixels": 520,
-                    "heightPixels": 300,
+                    "widthPixels": 620,
+                    "heightPixels": 340,
                 }},
             }
         }
@@ -1427,7 +1434,7 @@ def _atualizar_aba_graficos(sh, dados):
     try:
         largura  = col_final - _GRAF_MARCA_COL            # inclui a coluna da marca
         altura   = 1 + max(len(g["rotulos"]) for g in graficos)
-        linhas_ws = max(200, max(g["linha"] for g in graficos) * _GRAF_PASSO_LINHAS + 5)
+        linhas_ws = max(200, (len(graficos) // 2 + 1) * _GRAF_PASSO_LINHAS + 5)
 
         try:
             ws = sh.worksheet(ABA_GRAFICOS)
@@ -1473,7 +1480,7 @@ def _atualizar_aba_graficos(sh, dados):
                 continue
             if not any(v is not None for s in sers for v in s[2]):
                 continue
-            novos.append(_spec_grafico_linha(ws.id, g, col, len(sers), pos))
+            novos.append(_spec_grafico_linha(ws.id, g, col, sers, pos))
 
         if novos:
             sh.batch_update({"requests": novos})
@@ -1549,7 +1556,7 @@ def _garantir_reportlab():
 
 def _desenho_pdf(g, largura):
     """Desenha um gráfico como Drawing do reportlab (mesma geometria do SVG)."""
-    from reportlab.graphics.shapes import Circle, Drawing, Line, PolyLine, Rect, String
+    from reportlab.graphics.shapes import Circle, Drawing, Line, PolyLine, Polygon, Rect, String
     from reportlab.lib import colors
 
     prep = _preparar_grafico(g)
@@ -1557,7 +1564,7 @@ def _desenho_pdf(g, largura):
         return None
     rotulos, series = prep
     W, H, L, R, T, B = _DIM
-    ymin, ymax = _eixo_y(series, g["zero"], g.get("ylim"))
+    ymin, ymax = _eixo_y(series, g["zero"])
     pw, ph, n = W - L - R, H - T - B, len(rotulos)
     un, casas = g["un"], g["casas"]
     cinza, escuro = colors.HexColor("#666666"), colors.HexColor("#333333")
@@ -1569,22 +1576,23 @@ def _desenho_pdf(g, largura):
         return H - (T + ph - (v - ymin) / (ymax - ymin) * ph)
 
     d = Drawing(W, H)
-    d.add(String(W / 2, H - 22, _titulo_completo(g), textAnchor="middle", fontSize=17,
+    d.add(String(W / 2, H - 22, _titulo_completo(g), textAnchor="middle", fontSize=15,
                  fontName="Helvetica-Bold", fillColor=escuro))
     for k in range(5):
         v = ymin + (ymax - ymin) * k / 4
         yy = y(v)
         d.add(Line(L, yy, W - R, yy, strokeColor=colors.HexColor("#E0E0E0"), strokeWidth=1))
-        d.add(String(L - 6, yy - 4, f"{v:.{casas}f}{un}", textAnchor="end", fontSize=14,
+        d.add(String(L - 6, yy - 4, f"{v:.{casas}f}{un}", textAnchor="end", fontSize=12,
                      fontName="Helvetica", fillColor=cinza))
-    passo = max(1, math.ceil(n / 6))
+    passo = max(1, math.ceil(n / 8))
     for i, r in enumerate(rotulos):
         if i % passo == 0:
-            d.add(String(x(i), B - 16, str(r), textAnchor="middle", fontSize=14,
+            d.add(String(x(i), B - 16, str(r), textAnchor="middle", fontSize=12,
                          fontName="Helvetica", fillColor=cinza))
 
     for it in series:
         cor, vals, trac = colors.HexColor(it[1]), it[2], _eh_tracejada(it)
+        dash, forma = _estilo_serie(series, it)
         for sg in _segmentos(vals):
             if len(sg) < 2:
                 continue
@@ -1594,18 +1602,32 @@ def _desenho_pdf(g, largura):
             linha = PolyLine(pts, strokeColor=cor, strokeWidth=1.8 if trac else 2.5)
             if trac:
                 linha.strokeDashArray = [6, 4]
+            elif dash:
+                linha.strokeDashArray = [float(n_) for n_ in dash.split()]
             d.add(linha)
         if not trac:
             for i, v in enumerate(vals):
-                if v is not None:
-                    d.add(Circle(x(i), y(v), 3, fillColor=cor, strokeColor=cor))
+                if v is None:
+                    continue
+                cx, cy = x(i), y(v)
+                if forma == "square":
+                    d.add(Rect(cx - 3, cy - 3, 6, 6, fillColor=cor, strokeColor=cor))
+                elif forma == "triangle":
+                    d.add(Polygon([cx, cy + 4, cx - 4, cy - 3, cx + 4, cy - 3],
+                                  fillColor=cor, strokeColor=cor))
+                else:
+                    d.add(Circle(cx, cy, 3, fillColor=cor, strokeColor=cor))
 
     lx = L
     for it in series:
         if it[0]:
-            d.add(Rect(lx, 10, 12, 4, fillColor=colors.HexColor(it[1]), strokeColor=None))
-            d.add(String(lx + 16, 8, it[0], fontSize=14, fontName="Helvetica", fillColor=escuro))
-            lx += 40 + 7 * len(it[0])
+            dash, _f = _estilo_serie(series, it)
+            ln = Line(lx, 12, lx + 22, 12, strokeColor=colors.HexColor(it[1]), strokeWidth=2.5)
+            if dash:
+                ln.strokeDashArray = [float(n_) for n_ in dash.split()]
+            d.add(ln)
+            d.add(String(lx + 27, 8, it[0], fontSize=12, fontName="Helvetica", fillColor=escuro))
+            lx += 50 + 7 * len(it[0])
 
     esc = largura / W
     d.width, d.height = W * esc, H * esc
@@ -1638,38 +1660,23 @@ def _gerar_pdf_graficos(dados):
                   estilos["Normal"]),
         Spacer(1, 8),
     ]
-    from reportlab.platypus import Table, TableStyle
-    gap = 10
-    larg_painel = (largura - gap) / 2
     for secao in ORDEM_SECOES:
-        linhas, ordem = {}, []
+        desenhos = []
         for g in dados["graficos"]:
-            if g["secao"] != secao:
-                continue
-            dr = _desenho_pdf(g, larg_painel)
-            if dr is None:
-                continue
-            if g["linha"] not in linhas:
-                linhas[g["linha"]] = []
-                ordem.append(g["linha"])
-            linhas[g["linha"]].append(dr)
-        if not ordem:
+            if g["secao"] == secao:
+                dr = _desenho_pdf(g, largura)
+                if dr is not None:
+                    desenhos.append(dr)
+        if not desenhos:
             continue
         historia.append(Paragraph(secao, estilos["Heading2"]))
         for nota in dados["notas"].get(secao, []):
             historia.append(Paragraph(re.sub(r"<(?!/?strong>)[^>]+>", "", nota).replace("&nbsp;", " "),
                                       estilos["Italic"]))
         historia.append(Spacer(1, 4))
-        for ln in ordem:
-            ds = linhas[ln]
-            for i in range(0, len(ds), 2):            # 2 gráficos por linha no PDF
-                par = ds[i:i + 2]
-                tab = Table([par], colWidths=[larg_painel + gap / 2] * len(par), hAlign="LEFT")
-                tab.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0),
-                                         ("RIGHTPADDING", (0, 0), (-1, -1), gap / 2),
-                                         ("TOPPADDING", (0, 0), (-1, -1), 0),
-                                         ("BOTTOMPADDING", (0, 0), (-1, -1), 6)]))
-                historia.append(tab)
+        for dr in desenhos:
+            historia.append(dr)
+            historia.append(Spacer(1, 8))
     doc.build(historia)
 
     pdf = buf.getvalue()
@@ -1734,7 +1741,7 @@ def agendador():
 app = Flask(__name__)
 
 def _html_graficos(df):
-    """Conteúdo da aba "📈 Gráficos": botão de PDF + todas as seções (cada fonte no seu gráfico)."""
+    """Conteúdo da aba "📈 Gráficos": botão de PDF + todas as seções."""
     dados = obter_graficos(df)
     html = ('<p><a class="btn-pdf" href="/graficos.pdf">📄 Baixar PDF dos gráficos</a></p>')
     vazios = {
@@ -1745,28 +1752,16 @@ def _html_graficos(df):
                    'Atualize a página em alguns instantes.',
     }
     for secao in ORDEM_SECOES:
-        linhas, ordem = {}, []
-        for g in dados["graficos"]:
-            if g["secao"] != secao:
-                continue
-            svg = _svg_linha(g)
-            if not svg:
-                continue
-            if g["linha"] not in linhas:
-                linhas[g["linha"]] = []
-                ordem.append(g["linha"])
-            linhas[g["linha"]].append(svg)
-        if not ordem:
+        svgs = [_svg_linha(g) for g in dados["graficos"] if g["secao"] == secao]
+        svgs = [s for s in svgs if s]
+        if not svgs:
             if secao in vazios:
                 html += f'<h2 class="sec">{secao}</h2><div class="msg-vazio">{vazios[secao]}</div>'
             continue
         html += f'<h2 class="sec">{secao}</h2>'
         if dados["notas"].get(secao):
             html += '<p class="resumo">' + " &nbsp;|&nbsp; ".join(dados["notas"][secao]) + "</p>"
-        for ln in ordem:
-            html += ('<div class="linha-graf">'
-                     + "".join(f'<div class="graf">{s}</div>' for s in linhas[ln])
-                     + "</div>")
+        html += "".join(f'<div class="graf">{s}</div>' for s in svgs)
     return html
 
 @app.route("/")
@@ -1897,9 +1892,7 @@ def inicio():
         .msg-vazio {{ background: #FFF3E0; border: 1px solid #FFCC80; border-radius: 8px; padding: 12px 16px; font-size: 13px; color: #E65100; max-width: 900px; }}
         .sec {{ color: #1565C0; font-size: 17px; margin: 22px 0 6px; max-width: 900px; }}
         .resumo {{ font-size: 12px; color: #333; max-width: 900px; margin: -6px 0 16px; }}
-        .linha-graf {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; max-width: 1500px; }}
-        .graf {{ background: white; border-radius: 8px; padding: 10px; box-sizing: border-box;
-                 flex: 0 1 calc(33.333% - 8px); min-width: 380px; }}
+        .graf {{ background: white; border-radius: 8px; padding: 12px; margin-bottom: 16px; max-width: 900px; }}
 
         .wrapper {{ overflow-x: auto; }}
         table    {{ border-collapse: collapse; width: 100%; font-size: 12px; background: white; min-width: 900px; }}
