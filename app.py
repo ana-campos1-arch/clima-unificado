@@ -16,39 +16,33 @@
 #  6. Configure GSHEETS_NOME e GSHEETS_LINK como variáveis de
 #     ambiente no Render (ou deixe os valores padrão abaixo)
 #
+# requirements.txt: flask, pandas, numpy, requests, gspread,
+#                   google-auth, reportlab   <-- reportlab é NOVO (PDF)
+#
 # O QUE MUDOU NESTA VERSÃO
 # ─────────────────────────────────────────────────────────
-#  • NOVO: gráfico da chuva de hoje (hora a hora) com o total do dia no
-#    título — aparece mesmo quando o dia está zerado.
-#  • NOVO: gráficos de COMPARAÇÃO dos últimos 30 dias (temperatura, umidade,
-#    vento, chuva e radiação) entre INMET (Cachoeira do Sul), Open-Meteo e
-#    Estação Meteorológica. Cada série entra sozinha quando tem dados.
-#    Open-Meteo: 1 chamada leve a cada 6 h; INMET: o mesmo ZIP diário.
-#  • NOVO: gráficos de umidade, vento e radiação solar (hora a hora,
-#    hoje) na aba "📈 Gráficos", desenhados no servidor em SVG puro,
-#    sem chamadas extras a APIs.
-#  • NOVO: coluna "Chuva do dia (mm)" na tabela Open-Meteo – Hoje
-#    (horário), somando a precipitação das horas do dia.
-#  • Aba "📈 Gráficos" na interface principal (ao lado das abas
-#    do Open-Meteo e das demais fontes). Mostra a temperatura de hoje
-#    hora a hora e as máximas/mínimas da semana sem precisar abrir a
-#    tabela.
-#  • Aba "Gráficos" na planilha de destino (gráficos nativos do Google
-#    Sheets) continua sendo atualizada normalmente.
-#  • O INMET é coletado pela API de TEMPO REAL (apitempo.inmet.gov.br).
-#    O ZIP histórico anual só entra como RESERVA automática.
-#  • Reserva (ZIP) compara por HASH do conteúdo; cai para o ano anterior
-#    se o ZIP do ano corrente ainda não existir.
-#  • Retries com backoff exponencial, logging estruturado, e o Sheets
-#    só reescreve uma aba se os dados realmente mudaram.
-#  • /status mostra a data/hora mais recente de cada fonte de dados.
-#  • Coleta de radiação solar (Open-Meteo hora a hora e diária).
+#  • NOVO: botão "Baixar PDF dos gráficos" (rota /graficos.pdf), com todos
+#    os gráficos do site. PDF desenhado no servidor com reportlab (sem
+#    navegador, sem imagens temporárias) e guardado em cache até os dados
+#    mudarem.
+#  • NOVO: gráficos de comparação HOJE, hora a hora, Open-Meteo × Estação
+#    Meteorológica (temperatura, umidade, vento, chuva e radiação).
+#  • UNIFICADO: existe UMA lista de gráficos (_montar_graficos), montada uma
+#    vez por ciclo e guardada em cache. O site, o PDF e a aba "Gráficos" do
+#    Google Sheets leem a mesma lista — todos os gráficos aparecem nos três
+#    lugares, sem recalcular nada três vezes.
+#  • Aba "Gráficos" da planilha agora tem TODOS os gráficos nativos (antes só
+#    tinha 5). Os dados ficam à direita (coluna AD em diante); os gráficos,
+#    à esquerda. Se a aba tiver o layout antigo, ela é recriada uma vez.
+#  • Mantido: INMET pela API de tempo real (ZIP anual só como reserva),
+#    retries com backoff, Sheets só reescreve aba que mudou, /status.
 # ==========================================================
 
 import io
-import json
 import logging
+import math
 import os
+import re
 import threading
 import time
 import zipfile
@@ -687,7 +681,7 @@ def montar_tabela(forcar_inmet=False):
     return tabela_montada[cols]
 
 # ==========================================================
-# GOOGLE SHEETS
+# GOOGLE SHEETS — abas de dados
 # ==========================================================
 
 _hash_abas_enviadas = {}
@@ -727,312 +721,11 @@ def _escrever_aba_com_retry(sh, nome_aba, dados, tentativas=3, pular_dedup=False
     log.error(f"Falha ao escrever aba '{nome_aba}' após {tentativas} tentativas.")
 
 # ==========================================================
-# GRÁFICOS — dados (compartilhados pelo Sheets e pela interface web)
+# HISTÓRICOS (alimentam os gráficos de comparação e do INMET)
 # ==========================================================
-#
-# Aba "Gráficos" no Sheets: dois blocos NUMÉRICOS do Open-Meteo
-#     A:B  -> temperatura hora a hora de hoje
-#     D:F  -> máxima e mínima dos próximos 7 dias
-# Os gráficos nativos são criados uma vez; depois só os números mudam.
-# Gravados por função própria porque _escrever_aba_com_retry converte
-# tudo em texto, e o Sheets não plota texto.
-
-ABA_GRAFICOS = "Gráficos"
-_GRAF_LINHAS_MAX = 200
-
-def _dados_graficos(df):
-    """Extrai da tabela unificada os dois blocos numéricos do Open-Meteo."""
-    linhas_hora, linhas_dia = [], []
-    if df.empty or "Estacao" not in df.columns:
-        return linhas_hora, linhas_dia
-
-    # ── Temperatura hora a hora (hoje) ──
-    df_h = df[df["Estacao"] == "Open-Meteo – Hoje (horário)"].copy()
-    if not df_h.empty and "Temperatura (°C)" in df_h.columns:
-        df_h["_temp"] = pd.to_numeric(df_h["Temperatura (°C)"], errors="coerce")
-        df_h = df_h.dropna(subset=["_temp"]).sort_values("Hora")
-        linhas_hora = [
-            [str(r["Hora"])[:5], float(r["_temp"])] for _, r in df_h.iterrows()
-        ]
-
-    # ── Máxima e mínima da semana (próximos 7 dias) ──
-    df_d = df[df["Estacao"] == "Open-Meteo – Previsão (diária)"].copy()
-    if not df_d.empty and "Temp. Máx (°C)" in df_d.columns:
-        df_d["_max"] = pd.to_numeric(df_d["Temp. Máx (°C)"], errors="coerce")
-        df_d["_min"] = pd.to_numeric(df_d["Temp. Mín (°C)"], errors="coerce")
-        df_d = df_d.dropna(subset=["_max", "_min"]).sort_values("Data").head(7)
-        linhas_dia = [
-            [str(r["Data"]), float(r["_max"]), float(r["_min"])]
-            for _, r in df_d.iterrows()
-        ]
-
-    return linhas_hora, linhas_dia
-
-# Gráficos extras (hora a hora, hoje): umidade, vento e radiação solar.
-# Dados na aba "Gráficos", colunas U:X (índices 20-23), longe dos gráficos.
-_EXTRAS_NOMES   = ["Umidade (%RH)", "Vento (km/h)", "Radiação Solar (W/m²)"]
-_EXTRAS_COL_INI = 20
-
-def _linhas_hora_extras(df):
-    """[[hora, umidade, vento, radiação], ...] do Open-Meteo horário de hoje."""
-    if df.empty or "Estacao" not in df.columns:
-        return []
-    df_h = df[df["Estacao"] == "Open-Meteo – Hoje (horário)"]
-    if df_h.empty or any(n not in df_h.columns for n in _EXTRAS_NOMES):
-        return []
-    linhas = []
-    for _, r in df_h.sort_values("Hora").iterrows():
-        vals = [pd.to_numeric(r[n], errors="coerce") for n in _EXTRAS_NOMES]
-        linhas.append([str(r["Hora"])[:5]] + [None if pd.isna(v) else float(v) for v in vals])
-    return linhas
-
-def _faixa_grafico(sheet_id, col_ini, col_fim):
-    return {
-        "sheetId": sheet_id,
-        "startRowIndex": 0,
-        "endRowIndex": _GRAF_LINHAS_MAX,
-        "startColumnIndex": col_ini,
-        "endColumnIndex": col_fim,
-    }
-
-def _spec_grafico_linha(sheet_id, titulo, titulo_x, col_dominio, colunas_series,
-                        linha_ancora, coluna_ancora, titulo_y="Temperatura (°C)"):
-    """Monta a requisição addChart de um gráfico de linha."""
-    return {
-        "addChart": {
-            "chart": {
-                "spec": {
-                    "title": titulo,
-                    "basicChart": {
-                        "chartType": "LINE",
-                        "legendPosition": "BOTTOM_LEGEND",
-                        "headerCount": 1,
-                        "axis": [
-                            {"position": "BOTTOM_AXIS", "title": titulo_x},
-                            {"position": "LEFT_AXIS", "title": titulo_y},
-                        ],
-                        "domains": [{
-                            "domain": {"sourceRange": {"sources": [
-                                _faixa_grafico(sheet_id, col_dominio, col_dominio + 1)
-                            ]}}
-                        }],
-                        "series": [
-                            {
-                                "series": {"sourceRange": {"sources": [
-                                    _faixa_grafico(sheet_id, c, c + 1)
-                                ]}},
-                                "targetAxis": "LEFT_AXIS",
-                            }
-                            for c in colunas_series
-                        ],
-                    },
-                },
-                "position": {"overlayPosition": {
-                    "anchorCell": {
-                        "sheetId": sheet_id,
-                        "rowIndex": linha_ancora,
-                        "columnIndex": coluna_ancora,
-                    },
-                    "widthPixels": 620,
-                    "heightPixels": 340,
-                }},
-            }
-        }
-    }
-
-def _atualizar_aba_graficos(sh, df):
-    """
-    Reescreve os dados da aba "Gráficos" e, se ainda não houver gráficos
-    nela, cria os dois gráficos de linha. Falhas aqui não derrubam o
-    restante da exportação.
-    """
-    import gspread
-
-    linhas_hora, linhas_dia = _dados_graficos(df)
-    linhas_extras = _linhas_hora_extras(df)
-    if not linhas_hora and not linhas_dia:
-        log.info("Sem dados do Open-Meteo neste ciclo; aba de gráficos não foi atualizada.")
-        return
-
-    try:
-        try:
-            ws = sh.worksheet(ABA_GRAFICOS)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=ABA_GRAFICOS, rows=_GRAF_LINHAS_MAX, cols=26)
-        if ws.col_count < 26:
-            ws.resize(cols=26)
-
-        # Limpa só as colunas de dados (A:F e U:X), preservando os gráficos.
-        ws.batch_clear([f"A1:F{_GRAF_LINHAS_MAX}", f"U1:X{_GRAF_LINHAS_MAX}"])
-
-        if linhas_extras:
-            ws.update(
-                values=[["Hora"] + _EXTRAS_NOMES] + linhas_extras,
-                range_name="U1",
-                value_input_option="USER_ENTERED",
-            )
-
-        if linhas_hora:
-            ws.update(
-                values=[["Hora", "Temperatura (°C)"]] + linhas_hora,
-                range_name="A1",
-                value_input_option="USER_ENTERED",
-            )
-        if linhas_dia:
-            ws.update(
-                values=[["Data", "Temp. Máx (°C)", "Temp. Mín (°C)"]] + linhas_dia,
-                range_name="D1",
-                value_input_option="USER_ENTERED",
-            )
-
-        # Títulos dos gráficos que já existem na aba: só criamos os que faltam
-        # (assim planilhas antigas, com 2 gráficos, ganham os novos).
-        metadados = sh.fetch_sheet_metadata(
-            params={"fields": "sheets(properties(title),charts(spec(title)))"}
-        )
-        titulos_existentes = set()
-        for aba in metadados.get("sheets", []):
-            if aba.get("properties", {}).get("title") == ABA_GRAFICOS:
-                for g in aba.get("charts", []):
-                    titulos_existentes.add(g.get("spec", {}).get("title", ""))
-
-        c0 = _EXTRAS_COL_INI
-        desejados = [
-            _spec_grafico_linha(
-                ws.id, "Variação da temperatura hoje (hora a hora) — Open-Meteo",
-                "Hora", col_dominio=0, colunas_series=[1],
-                linha_ancora=0, coluna_ancora=7,
-            ),
-            _spec_grafico_linha(
-                ws.id, "Máxima e mínima da semana — Open-Meteo",
-                "Data", col_dominio=3, colunas_series=[4, 5],
-                linha_ancora=19, coluna_ancora=7,
-            ),
-            _spec_grafico_linha(
-                ws.id, "Umidade relativa hoje (hora a hora) — Open-Meteo",
-                "Hora", col_dominio=c0, colunas_series=[c0 + 1],
-                linha_ancora=38, coluna_ancora=7, titulo_y="Umidade (%)",
-            ),
-            _spec_grafico_linha(
-                ws.id, "Velocidade do vento hoje (hora a hora) — Open-Meteo",
-                "Hora", col_dominio=c0, colunas_series=[c0 + 2],
-                linha_ancora=57, coluna_ancora=7, titulo_y="Vento (km/h)",
-            ),
-            _spec_grafico_linha(
-                ws.id, "Radiação solar hoje (hora a hora) — Open-Meteo",
-                "Hora", col_dominio=c0, colunas_series=[c0 + 3],
-                linha_ancora=76, coluna_ancora=7, titulo_y="Radiação (W/m²)",
-            ),
-        ]
-        if not linhas_extras:
-            desejados = desejados[:2]
-        requisicoes = [
-            r for r in desejados
-            if r["addChart"]["chart"]["spec"]["title"] not in titulos_existentes
-        ]
-        if not requisicoes:
-            log.info("Aba 'Gráficos' atualizada (gráficos já existentes).")
-            _marcar_diagnostico("Gráficos (aba)", True, len(linhas_hora) + len(linhas_dia),
-                                "dados reescritos")
-            return
-
-        sh.batch_update({"requests": requisicoes})
-        log.info(f"{len(requisicoes)} gráfico(s) criado(s) na aba 'Gráficos'.")
-        _marcar_diagnostico("Gráficos (aba)", True, len(linhas_hora) + len(linhas_dia),
-                            f"{len(requisicoes)} gráfico(s) criado(s)")
-
-    except Exception as e:
-        log.error(f"Erro ao montar a aba de gráficos: {e}")
-        _marcar_diagnostico("Gráficos (aba)", False, 0, str(e))
-
-def exportar_para_sheets(df):
-    try:
-        import gspread  # noqa: F401 (garante que a lib está instalada)
-    except ImportError:
-        log.warning("gspread/google-auth não instalados. Verifique o requirements.txt.")
-        return
-
-    if not os.path.exists(GSHEETS_CREDENCIAIS):
-        log.warning(f"Credenciais não encontradas em {GSHEETS_CREDENCIAIS}. Configure o Secret File no Render.")
-        return
-
-    try:
-        gc = _obter_cliente_gspread()
-        sh = gc.open(GSHEETS_NOME)
-
-        if df.empty:
-            log.warning("Tabela principal vazia; nada para exportar neste ciclo.")
-            return
-
-        _escrever_aba_com_retry(sh, "Todas", df)
-
-        # Aba com os gráficos de temperatura (dia e semana, Open-Meteo).
-        _atualizar_aba_graficos(sh, df)
-
-        for fonte in df["Estacao"].unique():
-            df_f = df[df["Estacao"] == fonte]
-            cols = [c for c in df.columns if df_f[c].notna().any()]
-            _escrever_aba_com_retry(sh, fonte[:100], df_f[cols])
-
-        log.info(f"Google Sheets sincronizado: '{GSHEETS_NOME}'")
-    except Exception as e:
-        log.error(f"Erro ao exportar para Google Sheets: {e}")
-
-# ==========================================================
-# ATUALIZAÇÃO DE DADOS
-# ==========================================================
-
-def atualizar_dados(forcar_inmet=False):
-    global tabela, ultima_atualizacao
-    log.info("Iniciando ciclo de atualização dos dados...")
-    nova_tabela = montar_tabela(forcar_inmet=forcar_inmet)
-    with tabela_lock:
-        if not nova_tabela.empty:
-            tabela = nova_tabela
-            ultima_atualizacao = datetime.now()
-            log.info(f"Atualização concluída: {len(tabela)} registros.")
-        else:
-            log.warning("A atualização não trouxe dados novos; mantendo a tabela anterior.")
-
-    threading.Thread(target=_atualizar_historicos, daemon=True).start()
-
-    if GSHEETS_ATIVO:
-        with tabela_lock:
-            df_copia = tabela.copy()
-        exportar_para_sheets(df_copia)
-
-# ==========================================================
-# AGENDADOR
-# ==========================================================
-
-def proxima_execucao():
-    agora = datetime.now()
-    base  = agora.replace(minute=0, second=0, microsecond=0)
-    return base + timedelta(hours=INTERVALO_ATUALIZACAO_HORAS)
-
-def agendador():
-    while True:
-        alvo     = proxima_execucao()
-        segundos = (alvo - datetime.now()).total_seconds()
-        log.info(f"Próxima atualização automática agendada para {alvo.strftime('%d/%m/%Y às %H:%M')}")
-        time.sleep(max(segundos, 1))
-        try:
-            atualizar_dados()
-        except Exception as e:
-            log.error(f"Erro inesperado no ciclo de atualização: {e}")
-
-# ==========================================================
-# FLASK
-# ==========================================================
-
-app = Flask(__name__)
-
-# ==========================================================
-# INMET HISTÓRICO — médias diárias (alimenta a aba "📈 Gráficos")
-# ==========================================================
-# Baixa o ZIP anual do INMET no máximo 1x a cada 24 h, em thread própria,
-# e guarda só a temperatura média de cada dia por estação (resumo pequeno).
-# Não entra na tabela unificada nem no Sheets, então quase não pesa.
+# INMET: baixa o ZIP anual no máximo 1x a cada 24 h, em thread própria,
+# e guarda só os resumos diários por estação (pequeno).
+# Open-Meteo: 1 chamada leve a cada 6 h, resumida por dia.
 
 _historico_inmet    = {}     # cidade -> DataFrame[data, tmed, umid, vento, chuva, rad]
 _historico_hora     = None
@@ -1132,8 +825,6 @@ def _atualizar_historico_inmet():
         with _historico_lock:
             _historico_rodando = False
 
-# ── Open-Meteo: últimos 30 dias (1 chamada a cada 6 h, resumida por dia) ──
-
 _om_historico      = pd.DataFrame()
 _om_hist_hora      = None
 _om_hist_lock      = threading.Lock()
@@ -1183,179 +874,17 @@ def _atualizar_om_historico():
         with _om_hist_lock:                                # tenta de novo em ~1 h
             _om_hist_hora = datetime.now() - timedelta(hours=5)
 
-def _atualizar_historicos():
-    """Roda em segundo plano depois de cada ciclo: Open-Meteo (leve) e INMET (1x/dia)."""
-    try:
-        _atualizar_om_historico()
-    except Exception as e:
-        log.error(f"Erro no histórico do Open-Meteo: {e}")
-    try:
-        _atualizar_historico_inmet()
-    except Exception as e:
-        log.error(f"Erro no histórico do INMET: {e}")
-
 # ==========================================================
-# GRÁFICOS SVG (gerados no servidor, sem JavaScript nem CDN)
+# ESTAÇÃO METEOROLÓGICA — resumos diário e horário (p/ gráficos)
 # ==========================================================
 
-def _svg_linha(rotulos, series, titulo, unidade="°", unidade_tip="°C", zero_base=False, casas=0):
+_cache_estacao = {"stamp": None, "res": (None, {})}
+
+def _preparar_estacao(e):
     """
-    Gráfico de linhas em SVG puro.
-    series: lista de (nome, cor, valores[, tracejado]). Valores None
-    quebram a linha; séries com nome vazio não aparecem na legenda.
-    unidade/unidade_tip: sufixo dos números do eixo Y e do tooltip.
-    zero_base: força o eixo Y a começar em 0 (vento, radiação, chuva).
-    casas: casas decimais dos números do eixo Y.
-    """
-    import math
-    W, H, L, R, T, B = 860, 320, 48, 20, 42, 40
-    todos = [v for it in series for v in it[2] if v is not None]
-    if not todos:
-        return ""
-    ymin = 0 if zero_base else math.floor(min(todos)) - 1
-    ymax = math.ceil(max(todos)) + 1
-    pw, ph, n = W - L - R, H - T - B, len(rotulos)
-
-    def x(i):
-        return L + (pw / 2 if n == 1 else i * pw / (n - 1))
-
-    def y(v):
-        return T + ph - (v - ymin) / (ymax - ymin) * ph
-
-    s = [f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" font-family="Arial" font-size="11">',
-         f'<text x="{W/2}" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#333">{titulo}</text>']
-    for k in range(5):
-        v = ymin + (ymax - ymin) * k / 4
-        yy = y(v)
-        s.append(f'<line x1="{L}" y1="{yy:.1f}" x2="{W-R}" y2="{yy:.1f}" stroke="#e0e0e0"/>')
-        s.append(f'<text x="{L-6}" y="{yy+4:.1f}" text-anchor="end" fill="#666">{v:.{casas}f}{unidade}</text>')
-    passo = max(1, math.ceil(n / 8))
-    for i, r in enumerate(rotulos):
-        if i % passo == 0:
-            s.append(f'<text x="{x(i):.1f}" y="{H-B+16}" text-anchor="middle" fill="#666">{r}</text>')
-
-    for it in series:
-        nome, cor, vals = it[:3]
-        tracejado = len(it) > 3 and it[3]
-        segmentos, atual = [], []
-        for i, v in enumerate(vals):
-            if v is None:
-                if atual:
-                    segmentos.append(atual)
-                    atual = []
-            else:
-                atual.append((i, v))
-        if atual:
-            segmentos.append(atual)
-        for sg in segmentos:
-            pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in sg)
-            extra = ' stroke-dasharray="6 4"' if tracejado else ""
-            s.append(f'<polyline points="{pts}" fill="none" stroke="{cor}" '
-                     f'stroke-width="{1.8 if tracejado else 2.5}"{extra}/>')
-        if not tracejado:
-            for i, v in enumerate(vals):
-                if v is not None:
-                    s.append(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="3" fill="{cor}">'
-                             f'<title>{rotulos[i]}: {v:.1f}{unidade_tip}</title></circle>')
-
-    lx = L
-    for it in series:
-        if it[0]:
-            s.append(f'<rect x="{lx}" y="{H-14}" width="12" height="4" fill="{it[1]}"/>'
-                     f'<text x="{lx+16}" y="{H-9}" fill="#333">{it[0]}</text>')
-            lx += 40 + 7 * len(it[0])
-    s.append("</svg>")
-    return "".join(s)
-
-_CORES_INMET = {
-    "Cachoeira do Sul":         "#2E7D32",
-    "Santa Maria Automática":   "#F9A825",
-    "Santa Maria Convencional": "#AD1457",
-}
-
-def _graficos_inmet():
-    """Média diária (últimos 60 dias) com linha de tendência, e média mensal."""
-    import numpy as np
-    with _historico_lock:
-        dados = {c: d.copy() for c, d in _historico_inmet.items()}
-    if not dados:
-        return ('<div class="msg-vazio">⏳ Histórico do INMET ainda carregando '
-                '(é baixado 1x por dia). Atualize a página em alguns instantes.</div>')
-
-    ultimo = max(d["data"].max() for d in dados.values())
-    dias   = pd.date_range(ultimo - pd.Timedelta(days=59), ultimo)
-    rot_d  = [d.strftime("%d/%m") for d in dias]
-    series, resumo = [], []
-    for cidade, d in dados.items():
-        cor  = _CORES_INMET.get(cidade, "#555")
-        ser  = d.set_index("data")["tmed"].reindex(dias)
-        vals = [None if pd.isna(v) else float(v) for v in ser]
-        series.append((cidade, cor, vals))
-        idx = [i for i, v in enumerate(vals) if v is not None]
-        if len(idx) >= 3:
-            a, b = np.polyfit(idx, [vals[i] for i in idx], 1)
-            series.append(("", cor, [a * i + b for i in range(len(vals))], True))
-            media = float(np.mean([vals[i] for i in idx]))
-            resumo.append(f"<strong>{cidade}</strong>: média {media:.1f}°C, tendência {a:+.2f}°C/dia")
-
-    html = '<div class="graf">' + _svg_linha(
-        rot_d, series, "Temperatura média diária — INMET (60 dias, tracejado = tendência)") + "</div>"
-    if resumo:
-        html += '<p class="resumo">' + " &nbsp;|&nbsp; ".join(resumo).replace(".", ",") + "</p>"
-
-    meses = sorted(set().union(*[set(d["data"].dt.to_period("M")) for d in dados.values()]))
-    rot_m = [f"{m.month:02d}/{str(m.year)[2:]}" for m in meses]
-    series_m = []
-    for cidade, d in dados.items():
-        m = d.groupby(d["data"].dt.to_period("M"))["tmed"].mean()
-        series_m.append((cidade, _CORES_INMET.get(cidade, "#555"),
-                         [float(m[p]) if p in m.index else None for p in meses]))
-    html += '<div class="graf">' + _svg_linha(
-        rot_m, series_m, "Temperatura média mensal — INMET") + "</div>"
-    return html
-
-# Gráficos hora a hora de hoje (Open-Meteo) além da temperatura:
-# (coluna, título, cor, unidade no eixo, unidade no tooltip, eixo começa em 0, casas)
-GRAFICOS_HORARIOS = [
-    ("Umidade (%RH)",         "Umidade relativa hoje (hora a hora) — Open-Meteo",
-     "#00897B", "%", "%", False, 0),
-    ("Vento (km/h)",          "Velocidade do vento hoje (hora a hora) — Open-Meteo (km/h)",
-     "#6D4C41", "", " km/h", True, 0),
-    ("Radiação Solar (W/m²)", "Radiação solar hoje (hora a hora) — Open-Meteo (W/m²)",
-     "#F9A825", "", " W/m²", True, 0),
-    ("Precip. (mm)",          "Chuva hoje (hora a hora) — Open-Meteo (mm)",
-     "#3949AB", "", " mm", True, 1),
-]
-
-def _serie_horaria(df, coluna):
-    """Lista [[hora, valor], ...] de uma coluna do Open-Meteo horário."""
-    df_h = df[df["Estacao"] == "Open-Meteo – Hoje (horário)"]
-    if df_h.empty or coluna not in df_h.columns:
-        return []
-    v = pd.to_numeric(df_h[coluna], errors="coerce")
-    d = df_h.assign(_v=v).dropna(subset=["_v"]).sort_values("Hora")
-    return [[str(h)[:5], float(x)] for h, x in zip(d["Hora"], d["_v"])]
-
-# ── Comparação INMET × Open-Meteo × Estação Meteorológica (últimos 30 dias) ──
-
-INMET_COMPARACAO = "Cachoeira do Sul"     # estação do INMET usada na comparação
-
-# (chave, título, unidade no eixo, unidade no tooltip, eixo começa em 0, casas)
-VARIAVEIS_COMPARACAO = [
-    ("tmed",  "Temperatura média diária (°C)",       "°", "°C",     False, 0),
-    ("umid",  "Umidade relativa média diária (%)",   "%", "%",      False, 0),
-    ("vento", "Velocidade média do vento (km/h)",    "",  " km/h",  True,  0),
-    ("chuva", "Chuva total do dia (mm)",             "",  " mm",    True,  1),
-    ("rad",   "Radiação solar total do dia (MJ/m²)", "",  " MJ/m²", True,  0),
-]
-
-_cache_estacao = {"stamp": None, "df": None}
-
-def _agregar_estacao(e):
-    """
-    Resume por dia as leituras da Estação Meteorológica (1 por minuto).
-    Reconhece as colunas pelo nome (sem acento/maiúscula). Só entram dias
-    com leituras em pelo menos 18 horas diferentes (evita dia parcial).
+    Limpa as leituras da Estação Meteorológica (1 por minuto). Reconhece
+    as colunas pelo nome (sem acento/maiúscula). Devolve (g, tem_hora) com
+    colunas data, h (hora) e as variáveis encontradas, ou None.
     """
     norm = {c: _normalizar_texto(c) for c in e.columns}
 
@@ -1380,7 +909,7 @@ def _agregar_estacao(e):
 
     g = pd.DataFrame({"data": pd.to_datetime(e[c_data].astype(str), dayfirst=True,
                                               errors="coerce").dt.normalize()})
-    g["h"] = e[c_hora].astype(str).str[:2] if c_hora else "00"
+    g["h"] = e[c_hora].astype(str).str.extract(r"(\d{1,2})")[0] if c_hora else "00"
     if c_temp:
         t = num(c_temp);  g["tmed"] = t.where((t > -20) & (t < 60))
     if c_umid:
@@ -1391,115 +920,773 @@ def _agregar_estacao(e):
     if c_chuva:
         r = num(c_chuva); g["chuva"] = r.where((r >= 0) & (r < 50))
     if c_rad and "w/m" in norm[c_rad]:
-        w = num(c_rad);   g["rad"] = w.where(w >= 0)
+        w = num(c_rad);   g["rad"] = w.where(w >= 0)          # W/m²
     g = g.dropna(subset=["data"])
     if g.empty:
         return None
+    return g, bool(c_hora)
 
-    grp = g.groupby("data")
-    horas = grp["h"].nunique()
-    res = pd.DataFrame(index=horas.index)
-    for k in ("tmed", "umid", "vento"):
-        if k in g:
-            res[k] = grp[k].mean()
-    if "chuva" in g:
-        res["chuva"] = grp["chuva"].sum(min_count=1)
-    if "rad" in g:
-        res["rad"] = grp["rad"].mean() * 0.0864              # W/m² médio -> MJ/m² no dia
-    res = res[horas >= (18 if c_hora else 1)].dropna(how="all")
-    return res
-
-def _estacao_diaria(df):
+def _estacao_resumos(df):
+    """
+    Devolve (diario, horario_hoje):
+      diario: DataFrame indexado por dia (tmed, umid, vento, chuva, rad em MJ/m²)
+              — só dias com leituras em pelo menos 18 horas diferentes.
+      horario_hoje: {variável: {"HH:00": valor}} (chuva = soma da hora;
+              radiação em W/m², igual ao Open-Meteo).
+    Guardado em cache até a tabela mudar.
+    """
     stamp = (ultima_atualizacao, len(df))
     if _cache_estacao["stamp"] == stamp:
-        return _cache_estacao["df"]
-    res = None
+        return _cache_estacao["res"]
+    diario, horario = None, {}
     try:
         e = df[df["Estacao"] == "Estação Meteorológica"].dropna(axis=1, how="all")
-        if not e.empty:
-            res = _agregar_estacao(e)
+        prep = _preparar_estacao(e) if not e.empty else None
+        if prep is not None:
+            g, tem_hora = prep
+
+            # ── diário ──
+            grp = g.groupby("data")
+            horas = grp["h"].nunique()
+            res = pd.DataFrame(index=horas.index)
+            for k in ("tmed", "umid", "vento"):
+                if k in g:
+                    res[k] = grp[k].mean()
+            if "chuva" in g:
+                res["chuva"] = grp["chuva"].sum(min_count=1)
+            if "rad" in g:
+                res["rad"] = grp["rad"].mean() * 0.0864        # W/m² médio -> MJ/m² no dia
+            diario = res[horas >= (18 if tem_hora else 1)].dropna(how="all")
+
+            # ── hoje, hora a hora ──
+            gh = g[g["data"] == pd.Timestamp(date.today())]
+            if tem_hora and not gh.empty:
+                gh = gh.assign(hn=pd.to_numeric(gh["h"], errors="coerce")).dropna(subset=["hn"])
+                gh = gh[(gh["hn"] >= 0) & (gh["hn"] <= 23)]
+                gp = gh.groupby(gh["hn"].astype(int))
+                for k in ("tmed", "umid", "vento", "rad", "chuva"):
+                    if k in gh:
+                        s = gp[k].sum(min_count=1) if k == "chuva" else gp[k].mean()
+                        horario[k] = {f"{int(h):02d}:00": float(v) for h, v in s.items() if pd.notna(v)}
     except Exception as ex:
         log.error(f"Erro ao resumir a Estação Meteorológica: {ex}")
-    _cache_estacao["stamp"], _cache_estacao["df"] = stamp, res
-    return res
+    _cache_estacao["stamp"], _cache_estacao["res"] = stamp, (diario, horario)
+    return diario, horario
 
-def _graficos_comparacao(df):
-    """Um gráfico por variável, com INMET, Open-Meteo e Estação nos últimos 30 dias."""
-    dias = pd.date_range(end=pd.Timestamp(date.today()), periods=30)
-    rot  = [d.strftime("%d/%m") for d in dias]
+# ==========================================================
+# GRÁFICOS — UMA lista, usada pelo site, pelo PDF e pelo Google Sheets
+# ==========================================================
+# Cada gráfico é um dict:
+#   id, secao, titulo, sufixo (só site/PDF), rotulos, series, un, tip, zero,
+#   casas, ty (título do eixo Y), tx (título do eixo X)
+# series: lista de (nome, cor, valores[, tracejado]). valores com None = sem
+# dado. A lista é SEMPRE a mesma (mesmos gráficos, mesmas séries, mesmo
+# número de linhas); só os valores mudam. Isso mantém fixo o layout da aba
+# "Gráficos" no Sheets, onde cada gráfico nativo é criado uma única vez.
 
+SEC_OM    = "Open-Meteo — hoje e próximos dias"
+SEC_HOJE  = "Hoje, hora a hora — Open-Meteo × Estação Meteorológica"
+SEC_COMP  = "Últimos 30 dias — INMET × Open-Meteo × Estação Meteorológica"
+SEC_INMET = "INMET — histórico das estações"
+ORDEM_SECOES = [SEC_OM, SEC_HOJE, SEC_COMP, SEC_INMET]
+
+INMET_COMPARACAO = "Cachoeira do Sul"     # estação do INMET usada na comparação de 30 dias
+
+_HORAS = [f"{h:02d}:00" for h in range(24)]
+
+_CORES_INMET = {
+    "Cachoeira do Sul":         "#2E7D32",
+    "Santa Maria Automática":   "#F9A825",
+    "Santa Maria Convencional": "#AD1457",
+}
+
+# Gráficos hora a hora de hoje (Open-Meteo) além da temperatura:
+# (id, coluna, título, cor, unidade eixo, unidade tooltip, eixo em 0, casas, título Y)
+GRAFICOS_HORARIOS = [
+    ("om_umid",  "Umidade (%RH)",         "Umidade relativa hoje (hora a hora) — Open-Meteo",
+     "#00897B", "%", "%", False, 0, "Umidade (%)"),
+    ("om_vento", "Vento (km/h)",          "Velocidade do vento hoje (hora a hora) — Open-Meteo",
+     "#6D4C41", "", " km/h", True, 0, "Vento (km/h)"),
+    ("om_rad",   "Radiação Solar (W/m²)", "Radiação solar hoje (hora a hora) — Open-Meteo",
+     "#F9A825", "", " W/m²", True, 0, "Radiação (W/m²)"),
+    ("om_chuva", "Precip. (mm)",          "Chuva hoje (hora a hora) — Open-Meteo",
+     "#3949AB", "", " mm", True, 1, "Chuva (mm)"),
+]
+
+# Comparação de HOJE, hora a hora: Open-Meteo × Estação Meteorológica
+# (coluna Open-Meteo, chave da estação, título, un, tip, zero, casas, título Y)
+COMPARACAO_HOJE = [
+    ("Temperatura (°C)",      "tmed",  "Temperatura hoje: Open-Meteo × Estação",     "°", "°C",    False, 0, "Temperatura (°C)"),
+    ("Umidade (%RH)",         "umid",  "Umidade hoje: Open-Meteo × Estação",         "%", "%",     False, 0, "Umidade (%)"),
+    ("Vento (km/h)",          "vento", "Vento hoje: Open-Meteo × Estação",           "",  " km/h", True,  0, "Vento (km/h)"),
+    ("Precip. (mm)",          "chuva", "Chuva hoje (por hora): Open-Meteo × Estação","",  " mm",   True,  1, "Chuva (mm)"),
+    ("Radiação Solar (W/m²)", "rad",   "Radiação hoje: Open-Meteo × Estação",        "",  " W/m²", True,  0, "Radiação (W/m²)"),
+]
+
+# Comparação dos últimos 30 dias (resumo diário)
+# (chave, título, unidade no eixo, unidade no tooltip, eixo em 0, casas, título Y)
+VARIAVEIS_COMPARACAO = [
+    ("tmed",  "Temperatura média diária",       "°", "°C",     False, 0, "Temperatura (°C)"),
+    ("umid",  "Umidade relativa média diária",  "%", "%",      False, 0, "Umidade (%)"),
+    ("vento", "Velocidade média do vento",      "",  " km/h",  True,  0, "Vento (km/h)"),
+    ("chuva", "Chuva total do dia",             "",  " mm",    True,  1, "Chuva (mm)"),
+    ("rad",   "Radiação solar total do dia",    "",  " MJ/m²", True,  0, "Radiação (MJ/m²)"),
+]
+
+def _dados_graficos(df):
+    """Extrai da tabela unificada os dois blocos numéricos do Open-Meteo (hoje e semana)."""
+    linhas_hora, linhas_dia = [], []
+    if df.empty or "Estacao" not in df.columns:
+        return linhas_hora, linhas_dia
+
+    df_h = df[df["Estacao"] == "Open-Meteo – Hoje (horário)"].copy()
+    if not df_h.empty and "Temperatura (°C)" in df_h.columns:
+        df_h["_temp"] = pd.to_numeric(df_h["Temperatura (°C)"], errors="coerce")
+        df_h = df_h.dropna(subset=["_temp"]).sort_values("Hora")
+        linhas_hora = [[str(r["Hora"])[:5], float(r["_temp"])] for _, r in df_h.iterrows()]
+
+    df_d = df[df["Estacao"] == "Open-Meteo – Previsão (diária)"].copy()
+    if not df_d.empty and "Temp. Máx (°C)" in df_d.columns:
+        df_d["_max"] = pd.to_numeric(df_d["Temp. Máx (°C)"], errors="coerce")
+        df_d["_min"] = pd.to_numeric(df_d["Temp. Mín (°C)"], errors="coerce")
+        df_d = df_d.dropna(subset=["_max", "_min"]).sort_values("Data").head(7)
+        linhas_dia = [[str(r["Data"]), float(r["_max"]), float(r["_min"])] for _, r in df_d.iterrows()]
+
+    return linhas_hora, linhas_dia
+
+def _serie_horaria(df, coluna):
+    """Lista [[hora, valor], ...] de uma coluna do Open-Meteo horário."""
+    if df.empty or "Estacao" not in df.columns:
+        return []
+    df_h = df[df["Estacao"] == "Open-Meteo – Hoje (horário)"]
+    if df_h.empty or coluna not in df_h.columns:
+        return []
+    v = pd.to_numeric(df_h[coluna], errors="coerce")
+    d = df_h.assign(_v=v).dropna(subset=["_v"]).sort_values("Hora")
+    return [[str(h)[:5], float(x)] for h, x in zip(d["Hora"], d["_v"])]
+
+def _g(id_, secao, titulo, rot, series, un="", tip="", zero=False, casas=0,
+       ty="", tx="Hora", sufixo=""):
+    return {"id": id_, "secao": secao, "titulo": titulo, "sufixo": sufixo,
+            "rotulos": rot, "series": series, "un": un, "tip": tip,
+            "zero": zero, "casas": casas, "ty": ty, "tx": tx}
+
+def _montar_graficos(df):
+    """Monta TODOS os gráficos. Devolve {"graficos": [...], "notas": {seção: [html]}}."""
+    import numpy as np
+
+    graficos, notas = [], {s: [] for s in ORDEM_SECOES}
+
+    def v24(mapa):
+        return [mapa.get(h) for h in _HORAS]
+
+    # ── 1. Open-Meteo: hoje e semana ───────────────────────────────
+    horas, dias = _dados_graficos(df)
+    graficos.append(_g(
+        "om_temp_hoje", SEC_OM, "Temperatura hoje (hora a hora) — Open-Meteo", _HORAS,
+        [("Temperatura (°C)", "#1565C0", v24(dict(horas)))], "°", "°C", False, 0, "Temperatura (°C)"))
+
+    falta = 7 - len(dias)
+    graficos.append(_g(
+        "om_semana", SEC_OM, "Máxima e mínima da semana — Open-Meteo",
+        [r[0][5:] for r in dias] + [""] * falta,
+        [("Máx (°C)", "#E53935", [r[1] for r in dias] + [None] * falta),
+         ("Mín (°C)", "#1E88E5", [r[2] for r in dias] + [None] * falta)],
+        "°", "°C", False, 0, "Temperatura (°C)", tx="Data"))
+
+    for id_, coluna, titulo, cor, un, tip, zero, casas, ty in GRAFICOS_HORARIOS:
+        mapa = dict(_serie_horaria(df, coluna))
+        sufixo = ""
+        if coluna == "Precip. (mm)" and mapa:   # total do dia, mesmo que seja 0
+            sufixo = f" — total do dia: {sum(mapa.values()):.1f} mm".replace(".", ",")
+        graficos.append(_g(id_, SEC_OM, titulo, _HORAS, [(coluna, cor, v24(mapa))],
+                           un, tip, zero, casas, ty, sufixo=sufixo))
+
+    # ── 2. Hoje, hora a hora: Open-Meteo × Estação ────────────────
+    est_dia, est_hora = _estacao_resumos(df)
+    for col_om, chave, titulo, un, tip, zero, casas, ty in COMPARACAO_HOJE:
+        mapa_om = dict(_serie_horaria(df, col_om))
+        graficos.append(_g(
+            f"hoje_{chave}", SEC_HOJE, titulo, _HORAS,
+            [("Open-Meteo", "#1565C0", v24(mapa_om)),
+             ("Estação Meteorológica", "#E65100", v24(est_hora.get(chave, {})))],
+            un, tip, zero, casas, ty))
+    if not est_hora:
+        notas[SEC_HOJE].append("<strong>Estação Meteorológica</strong>: sem leituras de hoje "
+                               "(a linha entra sozinha quando houver dados)")
+    else:
+        notas[SEC_HOJE].append("Estação: média por hora das leituras (chuva = soma da hora); "
+                               "Open-Meteo: valor horário do modelo")
+
+    # ── 3. Últimos 30 dias: INMET × Open-Meteo × Estação ──────────
+    dias30 = pd.date_range(end=pd.Timestamp(date.today()), periods=30)
+    rot30  = [d.strftime("%d/%m") for d in dias30]
     with _historico_lock:
         d_inmet = _historico_inmet.get(INMET_COMPARACAO)
         inmet = None if d_inmet is None else d_inmet.set_index("data")
     with _om_hist_lock:
         om = _om_historico.copy()
-    est = _estacao_diaria(df)
-
     fontes = [
         (f"INMET {INMET_COMPARACAO}", "#2E7D32", inmet),
         ("Open-Meteo",                "#1565C0", om),
-        ("Estação Meteorológica",     "#E65100", est),
+        ("Estação Meteorológica",     "#E65100", est_dia),
     ]
-
-    html, usados = "", set()
-    for chave, titulo, un, tip, zero, casas in VARIAVEIS_COMPARACAO:
+    usados = set()
+    for chave, titulo, un, tip, zero, casas, ty in VARIAVEIS_COMPARACAO:
         series = []
         for nome, cor, d in fontes:
             if d is None or d.empty or chave not in d.columns:
-                continue
-            vals = [None if pd.isna(v) else float(v) for v in d[chave].reindex(dias)]
+                vals = [None] * 30
+            else:
+                vals = [None if pd.isna(v) else float(v) for v in d[chave].reindex(dias30)]
             if any(v is not None for v in vals):
-                series.append((nome, cor, vals))
                 usados.add(nome)
-        if series:
-            html += '<div class="graf">' + _svg_linha(
-                rot, series, f"{titulo} — últimos 30 dias", un, tip, zero, casas) + "</div>"
-
-    notas = []
-    for nome, _, d in fontes:
+            series.append((nome, cor, vals))
+        graficos.append(_g(f"comp30_{chave}", SEC_COMP, f"{titulo} — últimos 30 dias", rot30,
+                           series, un, tip, zero, casas, ty, tx="Dia"))
+    for nome, _, _d in fontes:
         if nome not in usados:
-            notas.append(f"<strong>{nome}</strong>: sem dados nos últimos 30 dias "
-                         f"(entra no gráfico automaticamente quando houver)")
-    if est is not None and not est.empty:
-        n_dias = int(est.reindex(dias).notna().any(axis=1).sum())
-        notas.append(f"<strong>Estação Meteorológica</strong>: {n_dias} de 30 dias com dados "
-                     f"(só dias com leituras em 18 h ou mais)")
-    notas.append("INMET vem do histórico oficial e costuma ter 1–3 semanas de atraso")
+            notas[SEC_COMP].append(f"<strong>{nome}</strong>: sem dados nos últimos 30 dias "
+                                   f"(entra no gráfico automaticamente quando houver)")
+    if est_dia is not None and not est_dia.empty:
+        n_dias = int(est_dia.reindex(dias30).notna().any(axis=1).sum())
+        notas[SEC_COMP].append(f"<strong>Estação Meteorológica</strong>: {n_dias} de 30 dias com dados "
+                               f"(só dias com leituras em 18 h ou mais)")
+    notas[SEC_COMP].append("INMET vem do histórico oficial e costuma ter 1–3 semanas de atraso")
 
-    cabecalho = ('<h2 class="sec">📊 Comparação — INMET × Open-Meteo × Estação Meteorológica</h2>'
-                 '<p class="resumo">' + " &nbsp;|&nbsp; ".join(notas) + "</p>")
-    if not html:
-        return cabecalho + ('<div class="msg-vazio">⏳ Dados de comparação ainda carregando '
-                            '(histórico é buscado em segundo plano). Atualize a página em instantes.</div>')
-    return cabecalho + html
+    # ── 4. INMET: 60 dias com tendência + média mensal ────────────
+    with _historico_lock:
+        dados = {c: d.copy() for c, d in _historico_inmet.items()}
+    ultimo = max((d["data"].max() for d in dados.values()), default=pd.Timestamp(date.today()))
+    dias60 = pd.date_range(ultimo - pd.Timedelta(days=59), ultimo)
+    rot60  = [d.strftime("%d/%m") for d in dias60]
+    series, tendencias, resumo = [], [], []
+    for cidade in ESTACOES.values():
+        cor = _CORES_INMET.get(cidade, "#555")
+        d = dados.get(cidade)
+        if d is None:
+            series.append((cidade, cor, [None] * 60))
+            continue
+        vals = [None if pd.isna(v) else float(v) for v in d.set_index("data")["tmed"].reindex(dias60)]
+        series.append((cidade, cor, vals))
+        idx = [i for i, v in enumerate(vals) if v is not None]
+        if len(idx) >= 3:
+            a, b = np.polyfit(idx, [vals[i] for i in idx], 1)
+            tendencias.append(("", cor, [a * i + b for i in range(len(vals))], True))
+            media = float(np.mean([vals[i] for i in idx]))
+            resumo.append(f"<strong>{cidade}</strong>: média {media:.1f}°C, tendência {a:+.2f}°C/dia")
+    graficos.append(_g("inmet_60d", SEC_INMET, "Temperatura média diária — INMET (60 dias)", rot60,
+                       series + tendencias, "°", "°C", False, 0, "Temperatura (°C)", tx="Dia",
+                       sufixo=", tracejado = tendência"))
+    if resumo:
+        notas[SEC_INMET].append(" &nbsp;|&nbsp; ".join(resumo).replace(".", ","))
+
+    ano = int(ultimo.year)
+    meses = [pd.Period(f"{ano}-{k:02d}", "M") for k in range(1, 13)]
+    series_m = []
+    for cidade in ESTACOES.values():
+        d = dados.get(cidade)
+        if d is None:
+            series_m.append((cidade, _CORES_INMET.get(cidade, "#555"), [None] * 12))
+            continue
+        m = d.groupby(d["data"].dt.to_period("M"))["tmed"].mean()
+        series_m.append((cidade, _CORES_INMET.get(cidade, "#555"),
+                         [float(m[p]) if p in m.index else None for p in meses]))
+    graficos.append(_g("inmet_mensal", SEC_INMET, "Temperatura média mensal — INMET",
+                       [f"{k:02d}/{str(ano)[2:]}" for k in range(1, 13)], series_m,
+                       "°", "°C", False, 0, "Temperatura (°C)", tx="Mês"))
+
+    return {"graficos": graficos, "notas": notas}
+
+_cache_graficos = {"stamp": None, "dados": None}
+_cache_graficos_lock = threading.Lock()
+
+def obter_graficos(df):
+    """Monta a lista de gráficos 1x por ciclo/atualização de histórico e reaproveita."""
+    stamp = (ultima_atualizacao, len(df), _historico_hora, _om_hist_hora)
+    with _cache_graficos_lock:
+        if _cache_graficos["stamp"] == stamp and _cache_graficos["dados"] is not None:
+            return _cache_graficos["dados"]
+    dados = _montar_graficos(df)
+    with _cache_graficos_lock:
+        _cache_graficos["stamp"], _cache_graficos["dados"] = stamp, dados
+    return dados
+
+# ==========================================================
+# GRÁFICOS — preparo comum (site e PDF)
+# ==========================================================
+
+_DIM = (860, 320, 48, 20, 42, 40)       # W, H, L, R, T, B
+
+def _titulo_completo(g):
+    return g["titulo"] + g.get("sufixo", "")
+
+def _eh_tracejada(s):
+    return len(s) > 3 and bool(s[3])
+
+def _preparar_grafico(g):
+    """
+    Descarta séries sem nenhum dado e corta rótulos vazios nas pontas.
+    Devolve (rotulos, series) ou None se o gráfico não tem dado nenhum.
+    """
+    series = [s for s in g["series"] if any(v is not None for v in s[2])]
+    base = [s for s in series if not _eh_tracejada(s)]
+    if not base:
+        return None
+    n = len(g["rotulos"])
+    idx = [i for i in range(n) if any(s[2][i] is not None for s in base)]
+    a, b = idx[0], idx[-1] + 1
+    rot = g["rotulos"][a:b]
+    series = [tuple(s[:2]) + (s[2][a:b],) + tuple(s[3:]) for s in series]
+    return rot, series
+
+def _eixo_y(series, zero):
+    todos = [v for it in series for v in it[2] if v is not None]
+    ymin = 0 if zero else math.floor(min(todos)) - 1
+    ymax = math.ceil(max(todos)) + 1
+    return ymin, ymax
+
+def _segmentos(vals):
+    segs, atual = [], []
+    for i, v in enumerate(vals):
+        if v is None:
+            if atual:
+                segs.append(atual)
+                atual = []
+        else:
+            atual.append((i, v))
+    if atual:
+        segs.append(atual)
+    return segs
+
+def _svg_linha(g):
+    """Gráfico de linhas em SVG puro, a partir de um dict da lista de gráficos."""
+    prep = _preparar_grafico(g)
+    if prep is None:
+        return ""
+    rotulos, series = prep
+    W, H, L, R, T, B = _DIM
+    ymin, ymax = _eixo_y(series, g["zero"])
+    pw, ph, n = W - L - R, H - T - B, len(rotulos)
+    un, tip, casas = g["un"], g["tip"], g["casas"]
+
+    def x(i):
+        return L + (pw / 2 if n == 1 else i * pw / (n - 1))
+
+    def y(v):
+        return T + ph - (v - ymin) / (ymax - ymin) * ph
+
+    s = [f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" font-family="Arial" font-size="11">',
+         f'<text x="{W/2}" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#333">'
+         f'{_titulo_completo(g)}</text>']
+    for k in range(5):
+        v = ymin + (ymax - ymin) * k / 4
+        yy = y(v)
+        s.append(f'<line x1="{L}" y1="{yy:.1f}" x2="{W-R}" y2="{yy:.1f}" stroke="#e0e0e0"/>')
+        s.append(f'<text x="{L-6}" y="{yy+4:.1f}" text-anchor="end" fill="#666">{v:.{casas}f}{un}</text>')
+    passo = max(1, math.ceil(n / 8))
+    for i, r in enumerate(rotulos):
+        if i % passo == 0:
+            s.append(f'<text x="{x(i):.1f}" y="{H-B+16}" text-anchor="middle" fill="#666">{r}</text>')
+
+    for it in series:
+        cor, vals, trac = it[1], it[2], _eh_tracejada(it)
+        for sg in _segmentos(vals):
+            pts = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in sg)
+            extra = ' stroke-dasharray="6 4"' if trac else ""
+            s.append(f'<polyline points="{pts}" fill="none" stroke="{cor}" '
+                     f'stroke-width="{1.8 if trac else 2.5}"{extra}/>')
+        if not trac:
+            for i, v in enumerate(vals):
+                if v is not None:
+                    s.append(f'<circle cx="{x(i):.1f}" cy="{y(v):.1f}" r="3" fill="{cor}">'
+                             f'<title>{rotulos[i]}: {v:.{max(casas, 1)}f}{g["tip"]}</title></circle>')
+
+    lx = L
+    for it in series:
+        if it[0]:
+            s.append(f'<rect x="{lx}" y="{H-14}" width="12" height="4" fill="{it[1]}"/>'
+                     f'<text x="{lx+16}" y="{H-9}" fill="#333">{it[0]}</text>')
+            lx += 40 + 7 * len(it[0])
+    s.append("</svg>")
+    return "".join(s)
+
+# ==========================================================
+# GRÁFICOS NO GOOGLE SHEETS (aba "Gráficos", gráficos nativos)
+# ==========================================================
+# Layout: gráficos à ESQUERDA (grade de 2 por linha); dados à DIREITA, a
+# partir da coluna AE. A coluna AD, linha 1, guarda a marca do layout: se
+# for diferente (aba antiga), a aba é recriada uma única vez.
+
+ABA_GRAFICOS        = "Gráficos"
+_GRAF_MARCA         = "layout-v3"
+_GRAF_MARCA_COL     = 29            # coluna AD (índice 0-based)
+_GRAF_COL_INI       = 30            # coluna AE: primeiro bloco de dados
+_GRAF_PASSO_LINHAS  = 18            # altura de cada gráfico, em linhas
+_GRAF_PASSO_COLUNAS = 8             # segundo gráfico da linha começa na coluna 8
+
+def _layout_sheets(graficos):
+    """[(gráfico, coluna_dos_rótulos, séries_sem_tracejado)], coluna_final."""
+    col, saida = _GRAF_COL_INI, []
+    for g in graficos:
+        sers = [s for s in g["series"] if not _eh_tracejada(s)]
+        saida.append((g, col, sers))
+        col += len(sers) + 2                 # rótulo + séries + 1 coluna de respiro
+    return saida, col
+
+def _faixa_grafico(sheet_id, col_ini, col_fim, linhas):
+    return {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": linhas,
+            "startColumnIndex": col_ini, "endColumnIndex": col_fim}
+
+def _spec_grafico_linha(sheet_id, g, col, nsers, posicao):
+    """Requisição addChart de um gráfico de linha nativo."""
+    linhas = len(g["rotulos"]) + 1
+    return {
+        "addChart": {
+            "chart": {
+                "spec": {
+                    "title": g["titulo"],
+                    "basicChart": {
+                        "chartType": "LINE",
+                        "legendPosition": "BOTTOM_LEGEND",
+                        "headerCount": 1,
+                        "axis": [
+                            {"position": "BOTTOM_AXIS", "title": g["tx"]},
+                            {"position": "LEFT_AXIS", "title": g["ty"]},
+                        ],
+                        "domains": [{"domain": {"sourceRange": {"sources": [
+                            _faixa_grafico(sheet_id, col, col + 1, linhas)]}}}],
+                        "series": [
+                            {"series": {"sourceRange": {"sources": [
+                                _faixa_grafico(sheet_id, col + 1 + j, col + 2 + j, linhas)]}},
+                             "targetAxis": "LEFT_AXIS"}
+                            for j in range(nsers)
+                        ],
+                    },
+                },
+                "position": {"overlayPosition": {
+                    "anchorCell": {
+                        "sheetId": sheet_id,
+                        "rowIndex": (posicao // 2) * _GRAF_PASSO_LINHAS,
+                        "columnIndex": (posicao % 2) * _GRAF_PASSO_COLUNAS,
+                    },
+                    "widthPixels": 620,
+                    "heightPixels": 340,
+                }},
+            }
+        }
+    }
+
+def _atualizar_aba_graficos(sh, dados):
+    """
+    Reescreve os dados da aba "Gráficos" (uma única chamada) e cria os
+    gráficos nativos que ainda não existem (só os que já têm dados).
+    Falhas aqui não derrubam o restante da exportação.
+    """
+    import gspread
+    from gspread.utils import rowcol_to_a1
+
+    graficos = dados["graficos"]
+    layout, col_final = _layout_sheets(graficos)
+    if not any(any(v is not None for s in sers for v in s[2]) for _, _, sers in layout):
+        log.info("Sem dados para os gráficos neste ciclo; aba de gráficos não foi atualizada.")
+        return
+
+    try:
+        largura  = col_final - _GRAF_MARCA_COL            # inclui a coluna da marca
+        altura   = 1 + max(len(g["rotulos"]) for g in graficos)
+        linhas_ws = max(200, (len(graficos) // 2 + 1) * _GRAF_PASSO_LINHAS + 5)
+
+        try:
+            ws = sh.worksheet(ABA_GRAFICOS)
+            if ws.cell(1, _GRAF_MARCA_COL + 1).value != _GRAF_MARCA:
+                log.info("Aba 'Gráficos' com layout antigo; recriando.")
+                sh.del_worksheet(ws)
+                raise gspread.exceptions.WorksheetNotFound
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=ABA_GRAFICOS, rows=linhas_ws, cols=col_final + 2)
+        if ws.col_count < col_final + 2 or ws.row_count < linhas_ws:
+            ws.resize(rows=max(ws.row_count, linhas_ws), cols=max(ws.col_count, col_final + 2))
+
+        # Matriz única com todos os blocos (marca + dados)
+        matriz = [[""] * largura for _ in range(altura)]
+        matriz[0][0] = _GRAF_MARCA
+        for g, col, sers in layout:
+            c = col - _GRAF_MARCA_COL
+            matriz[0][c] = g["tx"]
+            for j, s in enumerate(sers):
+                matriz[0][c + 1 + j] = s[0]
+            for i, r in enumerate(g["rotulos"]):
+                matriz[i + 1][c] = r
+                for j, s in enumerate(sers):
+                    v = s[2][i]
+                    matriz[i + 1][c + 1 + j] = "" if v is None else float(v)
+
+        # Limpa só a área de dados (à direita), preservando os gráficos
+        ws.batch_clear([f"{rowcol_to_a1(1, _GRAF_MARCA_COL + 1)}:{rowcol_to_a1(ws.row_count, ws.col_count)}"])
+        ws.update(values=matriz, range_name=rowcol_to_a1(1, _GRAF_MARCA_COL + 1),
+                  value_input_option="RAW")   # RAW: rótulos como "14:00" ou "07/10" ficam como texto
+
+        # Cria só os gráficos que ainda não existem e já têm dados
+        meta = sh.fetch_sheet_metadata(
+            params={"fields": "sheets(properties(title),charts(spec(title)))"})
+        existentes = set()
+        for aba in meta.get("sheets", []):
+            if aba.get("properties", {}).get("title") == ABA_GRAFICOS:
+                for ch in aba.get("charts", []):
+                    existentes.add(ch.get("spec", {}).get("title", ""))
+        novos = []
+        for pos, (g, col, sers) in enumerate(layout):
+            if g["titulo"] in existentes:
+                continue
+            if not any(v is not None for s in sers for v in s[2]):
+                continue
+            novos.append(_spec_grafico_linha(ws.id, g, col, len(sers), pos))
+
+        if novos:
+            sh.batch_update({"requests": novos})
+            log.info(f"{len(novos)} gráfico(s) criado(s) na aba 'Gráficos'.")
+        else:
+            log.info("Aba 'Gráficos' atualizada (gráficos já existentes).")
+        _marcar_diagnostico("Gráficos (aba)", True, len(graficos), f"{len(novos)} gráfico(s) criado(s)")
+
+    except Exception as e:
+        log.error(f"Erro ao montar a aba de gráficos: {e}")
+        _marcar_diagnostico("Gráficos (aba)", False, 0, str(e))
+
+def exportar_para_sheets(df):
+    try:
+        import gspread  # noqa: F401 (garante que a lib está instalada)
+    except ImportError:
+        log.warning("gspread/google-auth não instalados. Verifique o requirements.txt.")
+        return
+
+    if not os.path.exists(GSHEETS_CREDENCIAIS):
+        log.warning(f"Credenciais não encontradas em {GSHEETS_CREDENCIAIS}. Configure o Secret File no Render.")
+        return
+
+    try:
+        gc = _obter_cliente_gspread()
+        sh = gc.open(GSHEETS_NOME)
+
+        if df.empty:
+            log.warning("Tabela principal vazia; nada para exportar neste ciclo.")
+            return
+
+        _escrever_aba_com_retry(sh, "Todas", df)
+
+        # Aba com TODOS os gráficos (mesma lista do site e do PDF)
+        _atualizar_aba_graficos(sh, obter_graficos(df))
+
+        for fonte in df["Estacao"].unique():
+            df_f = df[df["Estacao"] == fonte]
+            cols = [c for c in df.columns if df_f[c].notna().any()]
+            _escrever_aba_com_retry(sh, fonte[:100], df_f[cols])
+
+        log.info(f"Google Sheets sincronizado: '{GSHEETS_NOME}'")
+    except Exception as e:
+        log.error(f"Erro ao exportar para Google Sheets: {e}")
+
+# ==========================================================
+# PDF DOS GRÁFICOS (reportlab, desenhado no servidor)
+# ==========================================================
+
+_cache_pdf = {"dados": None, "bytes": None}
+_cache_pdf_lock = threading.Lock()
+
+def _desenho_pdf(g, largura):
+    """Desenha um gráfico como Drawing do reportlab (mesma geometria do SVG)."""
+    from reportlab.graphics.shapes import Circle, Drawing, Line, PolyLine, Rect, String
+    from reportlab.lib import colors
+
+    prep = _preparar_grafico(g)
+    if prep is None:
+        return None
+    rotulos, series = prep
+    W, H, L, R, T, B = _DIM
+    ymin, ymax = _eixo_y(series, g["zero"])
+    pw, ph, n = W - L - R, H - T - B, len(rotulos)
+    un, casas = g["un"], g["casas"]
+    cinza, escuro = colors.HexColor("#666666"), colors.HexColor("#333333")
+
+    def x(i):
+        return L + (pw / 2 if n == 1 else i * pw / (n - 1))
+
+    def y(v):                                    # eixo Y do PDF é de baixo para cima
+        return H - (T + ph - (v - ymin) / (ymax - ymin) * ph)
+
+    d = Drawing(W, H)
+    d.add(String(W / 2, H - 22, _titulo_completo(g), textAnchor="middle", fontSize=15,
+                 fontName="Helvetica-Bold", fillColor=escuro))
+    for k in range(5):
+        v = ymin + (ymax - ymin) * k / 4
+        yy = y(v)
+        d.add(Line(L, yy, W - R, yy, strokeColor=colors.HexColor("#E0E0E0"), strokeWidth=1))
+        d.add(String(L - 6, yy - 4, f"{v:.{casas}f}{un}", textAnchor="end", fontSize=12,
+                     fontName="Helvetica", fillColor=cinza))
+    passo = max(1, math.ceil(n / 8))
+    for i, r in enumerate(rotulos):
+        if i % passo == 0:
+            d.add(String(x(i), B - 16, str(r), textAnchor="middle", fontSize=12,
+                         fontName="Helvetica", fillColor=cinza))
+
+    for it in series:
+        cor, vals, trac = colors.HexColor(it[1]), it[2], _eh_tracejada(it)
+        for sg in _segmentos(vals):
+            if len(sg) < 2:
+                continue
+            pts = []
+            for i, v in sg:
+                pts += [x(i), y(v)]
+            linha = PolyLine(pts, strokeColor=cor, strokeWidth=1.8 if trac else 2.5)
+            if trac:
+                linha.strokeDashArray = [6, 4]
+            d.add(linha)
+        if not trac:
+            for i, v in enumerate(vals):
+                if v is not None:
+                    d.add(Circle(x(i), y(v), 3, fillColor=cor, strokeColor=cor))
+
+    lx = L
+    for it in series:
+        if it[0]:
+            d.add(Rect(lx, 10, 12, 4, fillColor=colors.HexColor(it[1]), strokeColor=None))
+            d.add(String(lx + 16, 8, it[0], fontSize=12, fontName="Helvetica", fillColor=escuro))
+            lx += 40 + 7 * len(it[0])
+
+    esc = largura / W
+    d.width, d.height = W * esc, H * esc
+    d.scale(esc, esc)
+    return d
+
+def _gerar_pdf_graficos(dados):
+    """PDF com todos os gráficos, por seção. Em cache até a lista de gráficos mudar."""
+    with _cache_pdf_lock:
+        if _cache_pdf["dados"] is dados and _cache_pdf["bytes"]:
+            return _cache_pdf["bytes"]
+
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+
+    estilos = getSampleStyleSheet()
+    margem = 30
+    largura = A4[0] - 2 * margem
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=margem, rightMargin=margem,
+                            topMargin=margem, bottomMargin=margem,
+                            title="Clima Unificado — Gráficos")
+
+    agora = (ultima_atualizacao or datetime.now()).strftime("%d/%m/%Y às %H:%M")
+    historia = [
+        Paragraph("Clima Unificado — Gráficos", estilos["Title"]),
+        Paragraph(f"Dados atualizados em {agora}. Fontes: Open-Meteo, INMET e Estação Meteorológica.",
+                  estilos["Normal"]),
+        Spacer(1, 8),
+    ]
+    for secao in ORDEM_SECOES:
+        desenhos = []
+        for g in dados["graficos"]:
+            if g["secao"] == secao:
+                dr = _desenho_pdf(g, largura)
+                if dr is not None:
+                    desenhos.append(dr)
+        if not desenhos:
+            continue
+        historia.append(Paragraph(secao, estilos["Heading2"]))
+        for nota in dados["notas"].get(secao, []):
+            historia.append(Paragraph(re.sub(r"<(?!/?strong>)[^>]+>", "", nota).replace("&nbsp;", " "),
+                                      estilos["Italic"]))
+        historia.append(Spacer(1, 4))
+        for dr in desenhos:
+            historia.append(dr)
+            historia.append(Spacer(1, 8))
+    doc.build(historia)
+
+    pdf = buf.getvalue()
+    with _cache_pdf_lock:
+        _cache_pdf["dados"], _cache_pdf["bytes"] = dados, pdf
+    return pdf
+
+# ==========================================================
+# ATUALIZAÇÃO DE DADOS
+# ==========================================================
+
+def atualizar_dados(forcar_inmet=False):
+    global tabela, ultima_atualizacao
+    log.info("Iniciando ciclo de atualização dos dados...")
+    nova_tabela = montar_tabela(forcar_inmet=forcar_inmet)
+    with tabela_lock:
+        if not nova_tabela.empty:
+            tabela = nova_tabela
+            ultima_atualizacao = datetime.now()
+            log.info(f"Atualização concluída: {len(tabela)} registros.")
+        else:
+            log.warning("A atualização não trouxe dados novos; mantendo a tabela anterior.")
+
+    # Open-Meteo histórico é leve (1 chamada a cada 6 h): roda aqui para já
+    # entrar nos gráficos do Sheets. O ZIP do INMET (pesado, 1x/dia) fica em
+    # segundo plano e aparece no ciclo seguinte.
+    try:
+        _atualizar_om_historico()
+    except Exception as e:
+        log.error(f"Erro no histórico do Open-Meteo: {e}")
+    threading.Thread(target=_atualizar_historico_inmet, daemon=True).start()
+
+    if GSHEETS_ATIVO:
+        with tabela_lock:
+            df_copia = tabela.copy()
+        exportar_para_sheets(df_copia)
+
+# ==========================================================
+# AGENDADOR
+# ==========================================================
+
+def proxima_execucao():
+    agora = datetime.now()
+    base  = agora.replace(minute=0, second=0, microsecond=0)
+    return base + timedelta(hours=INTERVALO_ATUALIZACAO_HORAS)
+
+def agendador():
+    while True:
+        alvo     = proxima_execucao()
+        segundos = (alvo - datetime.now()).total_seconds()
+        log.info(f"Próxima atualização automática agendada para {alvo.strftime('%d/%m/%Y às %H:%M')}")
+        time.sleep(max(segundos, 1))
+        try:
+            atualizar_dados()
+        except Exception as e:
+            log.error(f"Erro inesperado no ciclo de atualização: {e}")
+
+# ==========================================================
+# FLASK
+# ==========================================================
+
+app = Flask(__name__)
 
 def _html_graficos(df):
-    """Conteúdo da aba "📈 Gráficos": Open-Meteo (hoje/semana), comparação de 30 dias e INMET histórico."""
-    horas, dias = _dados_graficos(df)
-    html = ""
-    if horas:
-        html += '<div class="graf">' + _svg_linha(
-            [r[0] for r in horas],
-            [("Temperatura (°C)", "#1565C0", [r[1] for r in horas])],
-            "Temperatura hoje (hora a hora) — Open-Meteo") + "</div>"
-    if dias:
-        html += '<div class="graf">' + _svg_linha(
-            [r[0][5:] for r in dias],
-            [("Máx (°C)", "#E53935", [r[1] for r in dias]),
-             ("Mín (°C)", "#1E88E5", [r[2] for r in dias])],
-            "Máxima e mínima da semana — Open-Meteo") + "</div>"
-    for coluna, titulo, cor, un, tip, zero, casas in GRAFICOS_HORARIOS:
-        serie = _serie_horaria(df, coluna)
-        if serie:
-            if coluna == "Precip. (mm)":      # mostra o total do dia, mesmo que seja 0
-                titulo += f" — total do dia: {sum(r[1] for r in serie):.1f} mm".replace(".", ",")
-            html += '<div class="graf">' + _svg_linha(
-                [r[0] for r in serie],
-                [(coluna, cor, [r[1] for r in serie])],
-                titulo, un, tip, zero, casas) + "</div>"
-    if not horas and not dias:
-        html += '<div class="msg-vazio">⚠️ Open-Meteo sem dados neste momento (veja o motivo na aba do Open-Meteo).</div>'
-    return html + _graficos_comparacao(df) + _graficos_inmet()
+    """Conteúdo da aba "📈 Gráficos": botão de PDF + todas as seções."""
+    dados = obter_graficos(df)
+    html = ('<p><a class="btn-pdf" href="/graficos.pdf">📄 Baixar PDF dos gráficos</a></p>')
+    vazios = {
+        SEC_OM:    '⚠️ Open-Meteo sem dados neste momento (veja o motivo na aba do Open-Meteo).',
+        SEC_COMP:  '⏳ Dados de comparação ainda carregando (histórico é buscado em segundo plano). '
+                   'Atualize a página em instantes.',
+        SEC_INMET: '⏳ Histórico do INMET ainda carregando (é baixado 1x por dia). '
+                   'Atualize a página em alguns instantes.',
+    }
+    for secao in ORDEM_SECOES:
+        svgs = [_svg_linha(g) for g in dados["graficos"] if g["secao"] == secao]
+        svgs = [s for s in svgs if s]
+        if not svgs:
+            if secao in vazios:
+                html += f'<h2 class="sec">{secao}</h2><div class="msg-vazio">{vazios[secao]}</div>'
+            continue
+        html += f'<h2 class="sec">{secao}</h2>'
+        if dados["notas"].get(secao):
+            html += '<p class="resumo">' + " &nbsp;|&nbsp; ".join(dados["notas"][secao]) + "</p>"
+        html += "".join(f'<div class="graf">{s}</div>' for s in svgs)
+    return html
 
 @app.route("/")
 def inicio():
@@ -1569,7 +1756,7 @@ def inicio():
         <div class="banner-gs">
             📊 Dados sincronizados com o Google Sheets:&nbsp;
             <a href="{GSHEETS_LINK}" target="_blank"><strong>Abrir planilha →</strong></a>
-            &nbsp;|&nbsp; veja os gráficos de temperatura na aba <strong>Gráficos</strong>.
+            &nbsp;|&nbsp; os mesmos gráficos do site estão na aba <strong>Gráficos</strong>.
         </div>"""
 
     banner_comunidade = """
@@ -1611,6 +1798,12 @@ def inicio():
         .btn:hover  {{ opacity: .8; }}
         .btn-ativo  {{ border-color: #222 !important; }}
         .btn-todas  {{ background: #e0e0e0; color: #333; }}
+
+        .btn-pdf {{
+            display: inline-block; background: #C62828; color: white; text-decoration: none;
+            padding: 9px 20px; border-radius: 20px; font-size: 13px; font-weight: bold;
+        }}
+        .btn-pdf:hover {{ opacity: .85; }}
 
         .src-om-hora        {{ background: #B3E5FC; color: #01579B; }}
         .src-om-prev        {{ background: #C5CAE9; color: #1A237E; }}
@@ -1659,6 +1852,28 @@ def inicio():
     {conteudo}
 </body>
 </html>"""
+
+@app.route("/graficos.pdf")
+def baixar_pdf_graficos():
+    """Baixa um PDF com todos os gráficos do site."""
+    with tabela_lock:
+        df_atual = tabela.copy()
+    if df_atual.empty:
+        return Response("Os dados ainda estão sendo buscados. Tente de novo em alguns segundos.",
+                        status=503, mimetype="text/plain; charset=utf-8")
+    try:
+        pdf = _gerar_pdf_graficos(obter_graficos(df_atual))
+    except ImportError:
+        log.error("reportlab não instalado; adicione 'reportlab' ao requirements.txt.")
+        return Response("PDF indisponível: falta instalar a biblioteca reportlab no servidor.",
+                        status=500, mimetype="text/plain; charset=utf-8")
+    except Exception as e:
+        log.error(f"Erro ao gerar o PDF dos gráficos: {e}")
+        return Response("Não foi possível gerar o PDF agora.", status=500,
+                        mimetype="text/plain; charset=utf-8")
+    nome = f"graficos-clima-{date.today().isoformat()}.pdf"
+    return Response(pdf, mimetype="application/pdf",
+                    headers={"Content-Disposition": f"attachment; filename={nome}"})
 
 def _data_mais_recente_por_fonte(df):
     """
