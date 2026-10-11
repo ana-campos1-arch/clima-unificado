@@ -43,6 +43,8 @@ import logging
 import math
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -1494,6 +1496,27 @@ def exportar_para_sheets(df):
 _cache_pdf = {"dados": None, "bytes": None}
 _cache_pdf_lock = threading.Lock()
 
+def _garantir_reportlab():
+    """
+    Se o reportlab não estiver instalado no servidor, tenta instalar sozinho
+    (pip) na primeira vez que o PDF é pedido. O ideal continua sendo ter
+    'reportlab' no requirements.txt; isto é só uma rede de segurança.
+    """
+    try:
+        import reportlab  # noqa: F401
+        return
+    except ImportError:
+        pass
+    log.warning("reportlab não encontrado; tentando instalar automaticamente...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "reportlab"],
+        check=True, timeout=240,
+    )
+    import importlib
+    importlib.invalidate_caches()
+    import reportlab  # noqa: F401  (se ainda falhar, o ImportError sobe para a rota)
+    log.info("reportlab instalado com sucesso.")
+
 def _desenho_pdf(g, largura):
     """Desenha um gráfico como Drawing do reportlab (mesma geometria do SVG)."""
     from reportlab.graphics.shapes import Circle, Drawing, Line, PolyLine, Rect, String
@@ -1565,6 +1588,7 @@ def _gerar_pdf_graficos(dados):
         if _cache_pdf["dados"] is dados and _cache_pdf["bytes"]:
             return _cache_pdf["bytes"]
 
+    _garantir_reportlab()
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
@@ -1863,8 +1887,8 @@ def baixar_pdf_graficos():
                         status=503, mimetype="text/plain; charset=utf-8")
     try:
         pdf = _gerar_pdf_graficos(obter_graficos(df_atual))
-    except ImportError:
-        log.error("reportlab não instalado; adicione 'reportlab' ao requirements.txt.")
+    except (ImportError, subprocess.SubprocessError) as e_import:
+        log.error(f"reportlab indisponível ({e_import}); adicione 'reportlab' ao requirements.txt.")
         return Response("PDF indisponível: falta instalar a biblioteca reportlab no servidor.",
                         status=500, mimetype="text/plain; charset=utf-8")
     except Exception as e:
